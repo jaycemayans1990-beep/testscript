@@ -1,273 +1,789 @@
--- GLX Auto Train + Race Multiplier — Speed Training⚡ (place 105553804282308) --[span_2](start_span)[span_2](end_span)
--- ข้อมูลจริงที่วัดจาก server ผ่าน bridge: --[span_3](start_span)[span_3](end_span)
---   Train: ProximityPrompt บน workspace.Treadmills.<N>.TP.TREADMILL คือสวิตช์จริง (server anchor HRP + tick speed เอง) --[span_4](start_span)[span_4](end_span)
---          rate คงที่ต่อสถานี (สูงขึ้นตามสถานี) — สถานี 32 วัดได้ ~3.5e21 speed/s --[span_5](start_span)[span_5](end_span)
---   Race : Network.FireServer("Join Race") ใช้ได้เมื่อยืนในโซน RaceProximity; studs = (Z-114)*DistanceNerf --[span_6](start_span)[span_6](end_span)
---          → TP แกน Z ระหว่างแข่ง = studs พุ่ง = ผ่าน milestone ทั้ง 6 (W1 31 wins → W8 3100 wins) × WinBoost (2375× ปัจจุบัน) --[span_7](start_span)[span_7](end_span)
---          วัดจริงรอบแข่งเดียว: +717M wins --[span_8](start_span)[span_8](end_span)
---   รอบแข่งเริ่มเองตามเวลา server (RaceTimer) — สคริปต์จับแล้ว join ให้เอง --[span_9](start_span)[span_9](end_span)
+-- language: Luau — file: aimbot_esp.lua
+-- target: Roblox client (Delta / executor with Drawing API)
+-- load:  loadstring(game:HttpGet("<bridge>/scripts/aimbot_esp.lua"))()
+-- unload: _G.AX_UNLOAD()
+--
+-- Everything here is client-side: ESP is a GPU overlay (never replicated),
+-- aim is camera/mouse manipulation done locally each frame. Nothing touches the server.
 
-local Players = game:GetService("Players") --[span_10](start_span)[span_10](end_span)
-local RS = game:GetService("ReplicatedStorage") --[span_11](start_span)[span_11](end_span)
-local RunService = game:GetService("RunService") --[span_12](start_span)[span_12](end_span)
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+local UIS         = game:GetService("UserInputService")
+local Workspace   = workspace
+local LP          = Players.LocalPlayer
 
-local Paper = require(RS.Paper) --[span_13](start_span)[span_13](end_span)
-local Network, Stats = Paper.Network, Paper.Stats --[span_14](start_span)[span_14](end_span)
-local TreadmillsTable = require(RS.Tables.Treadmills) --[span_15](start_span)[span_15](end_span)
-local RaceTable = require(RS.Tables.Race) --[span_16](start_span)[span_16](end_span)
+if _G.AX_UNLOAD then pcall(_G.AX_UNLOAD) end
 
-local LP = Players.LocalPlayer --[span_17](start_span)[span_17](end_span)
+---------------------------------------------------------------------------
+-- config
+---------------------------------------------------------------------------
+local CONFIG = {
+	esp = {
+		enabled     = true,
+		box         = true,
+		fill        = false,
+		name        = true,
+		health      = true,
+		distance    = true,
+		tracer      = true,
+		headDot     = true,
+		skeleton    = true,
+		chams       = false,
+		teamCheck   = true,
+		maxDistance = 900,
+		textSize    = 13,
+		boxColor    = Color3.fromRGB(95, 255, 205),
+		enemyColor  = Color3.fromRGB(255, 95, 115),
+		updateRate  = 60,       -- Hz cap for ESP passes (Drawing churn is the expensive part)
+	},
+	aim = {
+		enabled        = true,
+		mode           = "camera",            -- "camera" = view lock (works on touch) | "mouse" = cursor pull (PC)
+		key            = Enum.UserInputType.MouseButton2,
+		lockToggle     = false,               -- true = tap key to hold lock, false = hold key
+		fov            = 220,                 -- pixels from screen centre
+		smooth         = 0.30,                -- per-frame lerp alpha; 0.05 = glacial, 1 = instant snap
+		prediction     = 0.06,                -- seconds of velocity lead for hitscan games
+		projectileSpeed= 0,                   -- >0 overrides prediction with dist/speed lead
+		visibleOnly    = true,
+		teamCheck      = true,
+		triggerbot     = false,
+		triggerDelay   = 0.02,
+		humanize       = true,                -- per-frame jitter + micro reaction delay
+		reaction       = 0.09,                -- seconds before lock engages after key press
+		part           = "Head",
+		maxDistance    = 900,
+		autoMobile     = true,   -- touch device with no keyboard: aim always engaged while enabled
+	},
+}
 
--- ===== CONFIG ===== --[span_18](start_span)[span_18](end_span)
-local CFG = { --[span_19](start_span)[span_19](end_span)
-	TrainEnabled = true, --[span_20](start_span)[span_20](end_span)
-	RaceEnabled = true,       -- จับ race เริ่มแล้ว TP Z อัตโนมัติ --[span_21](start_span)[span_21](end_span)
-	TrainCycle = 60,          -- วน: ยืน treadmill 60s → พัก (กัน AFK kick) --[span_22](start_span)[span_22](end_span)
-	ZBoost = 8000,            -- ระยะ TP ต่อจังหวะระหว่างแข่ง (studs ก่อน nerf ×6) --[span_23](start_span)[span_23](end_span)
-	TPInterval = 1.2,         -- ทุกกี่วินาที TP ครั้งหนึ่งระหว่างแข่ง --[span_24](start_span)[span_24](end_span)
-	MaxZ = 60000,             -- milestone สุดท้าย 37500 studs — เกินไม่จำเป็น (studs = (Z-114)*6) --[span_25](start_span)[span_25](end_span)
-} --[span_26](start_span)[span_26](end_span)
+---------------------------------------------------------------------------
+-- tiny helpers
+---------------------------------------------------------------------------
+local function dnew(kind)
+	local ok, obj = pcall(Drawing.new, kind)
+	if ok and obj then return obj end
+	return nil
+end
 
-local running = false --[span_27](start_span)[span_27](end_span)
+local function dset(obj, props)
+	if not obj then return end
+	pcall(function()
+		for k, v in pairs(props) do obj[k] = v end
+	end)
+end
 
--- ===== GUI ===== --[span_28](start_span)[span_28](end_span)
-local gui = Instance.new("ScreenGui") --[span_29](start_span)[span_29](end_span)
-gui.Name = "GLXTrainRace" --[span_30](start_span)[span_30](end_span)
-gui.ResetOnSpawn = false --[span_31](start_span)[span_31](end_span)
-gui.Parent = LP:WaitForChild("PlayerGui") --[span_32](start_span)[span_32](end_span)
+local ALL_DRAWS = {}
+local function track(obj)
+	if obj then table.insert(ALL_DRAWS, obj) end
+	return obj
+end
 
-local panel = Instance.new("Frame") --[span_33](start_span)[span_33](end_span)
-panel.Size = UDim2.new(0, 210, 0, 118) --[span_34](start_span)[span_34](end_span)
-panel.Position = UDim2.new(0, 12, 0.52, 0) --[span_35](start_span)[span_35](end_span)
-panel.BackgroundColor3 = Color3.fromRGB(18, 18, 22) --[span_36](start_span)[span_36](end_span)
-panel.BackgroundTransparency = 0.15 --[span_37](start_span)[span_37](end_span)
-panel.BorderSizePixel = 0 --[span_38](start_span)[span_38](end_span)
-panel.Parent = gui --[span_39](start_span)[span_39](end_span)
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10) --[span_40](start_span)[span_40](end_span)
+local function dfree(obj)
+	if not obj then return end
+	pcall(function() obj:Remove() end)
+end
 
-local title = Instance.new("TextLabel") --[span_41](start_span)[span_41](end_span)
-title.Size = UDim2.new(1, 0, 0, 26) --[span_42](start_span)[span_42](end_span)
-title.BackgroundTransparency = 1 --[span_43](start_span)[span_43](end_span)
-title.Text = "GLX Train+Race" --[span_44](start_span)[span_44](end_span)
-title.TextColor3 = Color3.fromRGB(140, 230, 140) --[span_45](start_span)[span_45](end_span)
-title.Font = Enum.Font.GothamBold --[span_46](start_span)[span_46](end_span)
-title.TextSize = 14 --[span_47](start_span)[span_47](end_span)
-title.Parent = panel --[span_48](start_span)[span_48](end_span)
+local function now() return os.clock() end
 
-local status = Instance.new("TextLabel") --[span_49](start_span)[span_49](end_span)
-status.Size = UDim2.new(1, -12, 0, 20) --[span_50](start_span)[span_50](end_span)
-status.Position = UDim2.new(0, 6, 0, 28) --[span_51](start_span)[span_51](end_span)
-status.BackgroundTransparency = 1 --[span_52](start_span)[span_52](end_span)
-status.Text = "idle" --[span_53](start_span)[span_53](end_span)
-status.TextColor3 = Color3.fromRGB(210, 210, 210) --[span_54](start_span)[span_54](end_span)
-status.Font = Enum.Font.Gotham --[span_55](start_span)[span_55](end_span)
-status.TextSize = 11 --[span_56](start_span)[span_56](end_span)
-status.TextXAlignment = Enum.TextXAlignment.Left --[span_57](start_span)[span_57](end_span)
-status.Parent = panel --[span_58](start_span)[span_58](end_span)
+local HAS_DRAWING = Drawing ~= nil and Drawing.new ~= nil
+if not HAS_DRAWING then
+	warn("[AX] no Drawing API in this executor — ESP disabled, aimbot still active")
+	CONFIG.esp.enabled = false
+end
 
-local mainBtn = Instance.new("TextButton") --[span_59](start_span)[span_59](end_span)
-mainBtn.Size = UDim2.new(1, -12, 0, 32) --[span_60](start_span)[span_60](end_span)
-mainBtn.Position = UDim2.new(0, 6, 0, 50) --[span_61](start_span)[span_61](end_span)
-mainBtn.BackgroundColor3 = Color3.fromRGB(30, 110, 60) --[span_62](start_span)[span_62](end_span)
-mainBtn.TextColor3 = Color3.fromRGB(255, 255, 255) --[span_63](start_span)[span_63](end_span)
-mainBtn.Text = "START ALL" --[span_64](start_span)[span_64](end_span)
-mainBtn.Font = Enum.Font.GothamBold --[span_65](start_span)[span_65](end_span)
-mainBtn.TextSize = 13 --[span_66](start_span)[span_66](end_span)
-mainBtn.BorderSizePixel = 0 --[span_67](start_span)[span_67](end_span)
-mainBtn.Parent = panel --[span_68](start_span)[span_68](end_span)
-Instance.new("UICorner", mainBtn).CornerRadius = UDim.new(0, 8) --[span_69](start_span)[span_69](end_span)
+local VIM = nil
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
 
-local info = Instance.new("TextLabel") --[span_70](start_span)[span_70](end_span)
-info.Size = UDim2.new(1, -12, 0, 30) --[span_71](start_span)[span_71](end_span)
-info.Position = UDim2.new(0, 6, 0, 86) --[span_72](start_span)[span_72](end_span)
-info.BackgroundTransparency = 1 --[span_73](start_span)[span_73](end_span)
-info.Text = "wins: -" --[span_74](start_span)[span_74](end_span)
-info.TextColor3 = Color3.fromRGB(150, 200, 255) --[span_75](start_span)[span_75](end_span)
-info.Font = Enum.Font.Gotham --[span_76](start_span)[span_76](end_span)
-info.TextSize = 10 --[span_77](start_span)[span_77](end_span)
-info.TextXAlignment = Enum.TextXAlignment.Left --[span_78](start_span)[span_78](end_span)
-info.Parent = panel --[span_79](start_span)[span_79](end_span)
+local HAS_MOUSEREL = type(mousemoverel) == "function"
+local HAS_MOUSE1   = type(mouse1click) == "function"
 
--- ===== CORE ===== --[span_80](start_span)[span_80](end_span)
-local function fmt(n) --[span_81](start_span)[span_81](end_span)
-	local suffixes = {"", "K", "M", "B", "T", "Qa", "Qi"} --[span_82](start_span)[span_82](end_span)
-	local i = 1 --[span_83](start_span)[span_83](end_span)
-	while n >= 1000 and i < #suffixes do --[span_84](start_span)[span_84](end_span)
-		n /= 1000 --[span_85](start_span)[span_85](end_span)
-		i += 1 --[span_86](start_span)[span_86](end_span)
-	end --[span_87](start_span)[span_87](end_span)
-	return string.format("%.2f%s", n, suffixes[i]) --[span_88](start_span)[span_88](end_span)
-end --[span_89](start_span)[span_89](end_span)
+local CONNS = {}
 
-local function getHrp() --[span_90](start_span)[span_90](end_span)
-	local ch = LP.Character --[span_91](start_span)[span_91](end_span)
-	return ch and ch:FindFirstChild("HumanoidRootPart") --[span_92](start_span)[span_92](end_span)
-end --[span_93](start_span)[span_93](end_span)
+---------------------------------------------------------------------------
+-- player / character utilities
+---------------------------------------------------------------------------
+local function getChar(plr)
+	local ok, c = pcall(function() return plr.Character end)
+	if ok and c and c.Parent then return c end
+	return nil
+end
 
--- หาสถานีสูงสุดที่ Speed ผ่าน Requirement --[span_94](start_span)[span_94](end_span)
-local function bestStation() --[span_95](start_span)[span_95](end_span)
-	local speed = Stats.GetValue("Speed") or 0 --[span_96](start_span)[span_96](end_span)
-	local best = 1 --[span_97](start_span)[span_97](end_span)
-	for id = 1, 66 do --[span_98](start_span)[span_98](end_span)
-		local data = TreadmillsTable[id] --[span_99](start_span)[span_99](end_span)
-		if data and speed >= data.Requirement then --[span_100](start_span)[span_100](end_span)
-			best = id --[span_101](start_span)[span_101](end_span)
-		end --[span_102](start_span)[span_102](end_span)
-	end --[span_103](start_span)[span_103](end_span)
-	return best --[span_104](start_span)[span_104](end_span)
-end --[span_105](start_span)[span_105](end_span)
+local function alive(char)
+	local h = char and char:FindFirstChildOfClass("Humanoid")
+	if not h then return false end
+	return h.Health > 0
+end
 
--- หา treadmill ใน world ปัจจุบันที่ใช้ได้ (สถานีต้องมีอยู่จริงใน workspace + world ตรง) --[span_106](start_span)[span_106](end_span)
-local function findTreadmillNearby() --[span_107](start_span)[span_107](end_span)
-	-- ใช้สถานีที่อยู่ใกล้สุดก่อน (world ปัจจุบัน) --[span_108](start_span)[span_108](end_span)
-	local worldsUnlocked = Stats.GetValue("WorldsUnlocked") or 1 --[span_109](start_span)[span_109](end_span)
-	local candidates = {} --[span_110](start_span)[span_110](end_span)
-	for _, obj in ipairs(workspace.Treadmills:GetChildren()) do --[span_111](start_span)[span_111](end_span)
-		local id = tonumber(obj.Name) --[span_112](start_span)[span_112](end_span)
-		if id then --[span_113](start_span)[span_113](end_span)
-			local data = TreadmillsTable[id] --[span_114](start_span)[span_114](end_span)
-			if data and (Stats.GetValue("Speed") or 0) >= data.Requirement then --[span_115](start_span)[span_115](end_span)
-				local world = obj:GetAttribute("World") or 1 --[span_116](start_span)[span_116](end_span)
-				if world <= worldsUnlocked then --[span_117](start_span)[span_117](end_span)
-					table.insert(candidates, {id = id, model = obj, world = world}) --[span_118](start_span)[span_118](end_span)
-				end --[span_119](start_span)[span_119](end_span)
-			end --[span_120](start_span)[span_120](end_span)
-		end --[span_121](start_span)[span_121](end_span)
-	end --[span_122](start_span)[span_122](end_span)
-	-- เรียงจากสถานีสูงสุดลงมา — สถานีสูงให้ rate มากกว่า (วัดยืนยัน) --[span_123](start_span)[span_123](end_span)
-	table.sort(candidates, function(a, b) return a.id > b.id end) --[span_124](start_span)[span_124](end_span)
-	return candidates[1] --[span_125](start_span)[span_125](end_span)
-end --[span_126](start_span)[span_126](end_span)
+local function partOf(char, name)
+	if not char then return nil end
+	local ok, p = pcall(function() return char:FindFirstChild(name) end)
+	return ok and p or nil
+end
 
-local function useTreadmill(entry) --[span_127](start_span)[span_127](end_span)
-	local hrp = getHrp() --[span_128](start_span)[span_128](end_span)
-	if not hrp then return false end --[span_129](start_span)[span_129](end_span)
-	local tp = entry.model:FindFirstChild("TP") --[span_130](start_span)[span_130](end_span)
-	if not tp then return false end --[span_131](start_span)[span_131](end_span)
-	hrp.CFrame = tp.CFrame + Vector3.new(0, 3, 0) --[span_132](start_span)[span_132](end_span)
-	task.wait(0.35) --[span_133](start_span)[span_133](end_span)
-	local prompt = tp:FindFirstChild("TREADMILL") --[span_134](start_span)[span_134](end_span)
-	if prompt and fireproximityprompt then --[span_135](start_span)[span_135](end_span)
-		fireproximityprompt(prompt) --[span_136](start_span)[span_136](end_span)
-		task.wait(0.8) --[span_137](start_span)[span_137](end_span)
-		return hrp.Anchored --[span_138](start_span)[span_138](end_span)
-	end --[span_139](start_span)[span_139](end_span)
-	return false --[span_140](start_span)[span_140](end_span)
-end --[span_141](start_span)[span_141](end_span)
+local function isTeamMate(plr)
+	if plr == LP then return true end
+	local ok, myTeam = pcall(function() return LP.Team end)
+	if not ok or not myTeam then return false end
+	local ok2, theirTeam = pcall(function() return plr.Team end)
+	return ok2 and theirTeam == myTeam
+end
 
--- จัด world: ถ้าสถานีที่ดีที่สุดอยู่ world อื่น → Set Current World (ยิง remote ตรง) --[span_142](start_span)[span_142](end_span)
-local function ensureWorld(targetWorld) --[span_143](start_span)[span_143](end_span)
-	local current = Stats.GetValue("CurrentWorld") --[span_144](start_span)[span_144](end_span)
-	if current == targetWorld then return true end --[span_145](start_span)[span_145](end_span)
-	local ok = pcall(function() --[span_146](start_span)[span_146](end_span)
-		return Network.InvokeServer("Set Current World", targetWorld) --[span_147](start_span)[span_147](end_span)
-	end) --[span_148](start_span)[span_148](end_span)
-	task.wait(1.5) --[span_149](start_span)[span_149](end_span)
-	return ok --[span_150](start_span)[span_150](end_span)
-end --[span_151](start_span)[span_151](end_span)
+local function anyTeamCheck()
+	return CONFIG.esp.teamCheck or CONFIG.aim.teamCheck
+end
 
--- กันลอย: วางตัวลงพื้นใหม่หลัง dismount --[span_152](start_span)[span_152](end_span)
-local function dismount() --[span_153](start_span)[span_153](end_span)
-	pcall(function() Network.FireServer("Dismount Treadmill") end) --[span_154](start_span)[span_154](end_span)
-	task.wait(0.5) --[span_155](start_span)[span_155](end_span)
-end --[span_156](start_span)[span_156](end_span)
+---------------------------------------------------------------------------
+-- screen projection
+---------------------------------------------------------------------------
+local function project(pos)
+	local cam = Workspace.CurrentCamera
+	if not cam then return Vector2.zero, false end
+	local sp, onScreen = cam:WorldToViewportPoint(pos)
+	return Vector2.new(sp.X, sp.Y), onScreen and sp.Z > 0
+end
 
-local lastWins = Stats.GetValue("Wins") or 0 --[span_157](start_span)[span_157](end_span)
-task.spawn(function() --[span_158](start_span)[span_158](end_span)
-	while true do --[span_159](start_span)[span_159](end_span)
-		task.wait(2) --[span_160](start_span)[span_160](end_span)
-		local w = Stats.GetValue("Wins") --[span_161](start_span)[span_161](end_span)
-		if w and lastWins then --[span_162](start_span)[span_162](end_span)
-			local d = w - lastWins --[span_163](start_span)[span_163](end_span)
-			info.Text = d > 0 and ("+" .. fmt(d) .. " wins / 2s") or ("wins: " .. fmt(w)) --[span_164](start_span)[span_164](end_span)
-		end --[span_165](start_span)[span_165](end_span)
-		lastWins = w --[span_166](start_span)[span_166](end_span)
-	end --[span_167](start_span)[span_167](end_span)
-end) --[span_168](start_span)[span_168](end_span)
--- ===== LOOPS ===== --[span_170](start_span)[span_170](end_span)
--- [A] Train loop — ยืน treadmill สถานีสูงสุดที่เข้าได้ วนไปเรื่อย ๆ --[span_171](start_span)[span_171](end_span)
-task.spawn(function() --[span_172](start_span)[span_172](end_span)
-	while true do --[span_173](start_span)[span_173](end_span)
-		if running and CFG.TrainEnabled then --[span_174](start_span)[span_174](end_span)
-			local raceActive = RS.Values.RaceActive.Value --[span_175](start_span)[span_175](end_span)
-			if not raceActive then --[span_176](start_span)[span_176](end_span)
-				local entry = findTreadmillNearby() --[span_177](start_span)[span_177](end_span)
-				if entry then --[span_178](start_span)[span_178](end_span)
-					status.Text = "train @ สถานี " .. entry.id --[span_179](start_span)[span_179](end_span)
-					local ok = useTreadmill(entry) --[span_180](start_span)[span_180](end_span)
-					if ok then --[span_181](start_span)[span_181](end_span)
-						task.wait(CFG.TrainCycle) --[span_182](start_span)[span_182](end_span)
-						dismount() --[span_183](start_span)[span_183](end_span)
-					else --[span_184](start_span)[span_184](end_span)
-						task.wait(3) --[span_185](start_span)[span_185](end_span)
-					end --[span_186](start_span)[span_186](end_span)
-				else --[span_187](start_span)[span_187](end_span)
-					status.Text = "ไม่มีสถานีที่เข้าได้" --[span_188](start_span)[span_188](end_span)
-					task.wait(5) --[span_189](start_span)[span_189](end_span)
-				end --[span_190](start_span)[span_190](end_span)
-			else --[span_191](start_span)[span_191](end_span)
-				task.wait(2) --[span_192](start_span)[span_192](end_span)
-			end --[span_193](start_span)[span_193](end_span)
-		else --[span_194](start_span)[span_194](end_span)
-			task.wait(0.5) --[span_195](start_span)[span_195](end_span)
-		end --[span_196](start_span)[span_196](end_span)
-	end --[span_197](start_span)[span_197](end_span)
-end) --[span_198](start_span)[span_198](end_span)
+-- screen-space bounds from the model's own bounding box (rig-agnostic)
+local function screenBounds(char)
+	local cam = Workspace.CurrentCamera
+	if not cam then return nil end
 
--- [B] Race loop — จับ race เริ่ม → Join → TP Z ยิง milestone --[span_199](start_span)[span_199](end_span)
-task.spawn(function() --[span_200](start_span)[span_200](end_span)
-	while true do --[span_201](start_span)[span_201](end_span)
-		if running and CFG.RaceEnabled then --[span_202](start_span)[span_202](end_span)
-			local raceActive = RS.Values.RaceActive.Value --[span_203](start_span)[span_203](end_span)
-			if raceActive then --[span_204](start_span)[span_204](end_span)
-				local hrp = getHrp() --[span_205](start_span)[span_205](end_span)
-				if hrp then --[span_206](start_span)[span_206](end_span)
-					-- ต้องอยู่โซน race ก่อน: หา RaceProximity ของ world ปัจจุบัน --[span_207](start_span)[span_207](end_span)
-					local currentWorldName = nil --[span_208](start_span)[span_208](end_span)
-					local worldNames = {"Spawn", "Beach", "Steampunk", "Wild West", "Japan", "Atlantis", "Magma", "Moon"} --[span_209](start_span)[span_209](end_span)
-					local cw = Stats.GetValue("CurrentWorld") or 1 --[span_210](start_span)[span_210](end_span)
-					currentWorldName = worldNames[cw] or "Spawn" --[span_211](start_span)[span_211](end_span)
-					local wfolder = workspace:FindFirstChild("Worlds") and workspace.Worlds:FindFirstChild(currentWorldName) --[span_212](start_span)[span_212](end_span)
-					local rp = wfolder and wfolder:FindFirstChild("RaceProximity") --[span_213](start_span)[span_213](end_span)
-					if rp then --[span_214](start_span)[span_214](end_span)
-						hrp.CFrame = rp:GetPivot() + Vector3.new(0, 3, 0) --[span_215](start_span)[span_215](end_span)
-						task.wait(0.4) --[span_216](start_span)[span_216](end_span)
-					end --[span_217](start_span)[span_217](end_span)
-					-- join (ยิงซ้ำ 3 ครั้งกันเผื่อ) --[span_218](start_span)[span_218](end_span)
-					for _ = 1, 3 do --[span_219](start_span)[span_219](end_span)
-						pcall(function() Network.FireServer("Join Race") end) --[span_220](start_span)[span_220](end_span)
-						task.wait(0.5) --[span_221](start_span)[span_221](end_span)
-					end --[span_222](start_span)[span_222](end_span)
-					status.Text = "แข่ง: ยิง Z!" --[span_223](start_span)[span_223](end_span)
-					-- TP Z วนขึ้นเรื่อย ๆ จน race จบ --[span_224](start_span)[span_224](end_span)
-					local traveled = 0 --[span_225](start_span)[span_225](end_span)
-					while RS.Values.RaceActive.Value and running do --[span_226](start_span)[span_226](end_span)
-						traveled += CFG.ZBoost --[span_227](start_span)[span_227](end_span)
-						local base = hrp.Position --[span_228](start_span)[span_228](end_span)
-						hrp.CFrame = CFrame.new(base.X, base.Y + 1, base.Z + CFG.ZBoost) --[span_229](start_span)[span_229](end_span)
-						task.wait(CFG.TPInterval) --[span_230](start_span)[span_230](end_span)
-					end --[span_231](start_span)[span_231](end_span)
-					status.Text = "จบแข่ง traveled~" .. fmt(traveled * 6) .. " studs" --[span_232](start_span)[span_232](end_span)
-					task.wait(2) --[span_233](start_span)[span_233](end_span)
-				end --[span_234](start_span)[span_234](end_span)
-			end --[span_235](start_span)[span_235](end_span)
-		end --[span_236](start_span)[span_236](end_span)
-		task.wait(1) --[span_237](start_span)[span_237](end_span)
-	end --[span_238](start_span)[span_238](end_span)
-end) --[span_239](start_span)[span_239](end_span)
+	local ok, cf, size = pcall(function()
+		local c, s = char:GetBoundingBox()
+		return c, s
+	end)
 
-mainBtn.MouseButton1Click:Connect(function() --[span_240](start_span)[span_240](end_span)
-	running = not running --[span_241](start_span)[span_241](end_span)
-	mainBtn.Text = running and "STOP ALL" or "START ALL" --[span_242](start_span)[span_242](end_span)
-	mainBtn.BackgroundColor3 = running and Color3.fromRGB(150, 45, 45) or Color3.fromRGB(30, 110, 60) --[span_243](start_span)[span_243](end_span)
-	if running then --[span_244](start_span)[span_244](end_span)
-		status.Text = "กำลังทำงาน..." --[span_245](start_span)[span_245](end_span)
-	else --[span_246](start_span)[span_246](end_span)
-		dismount() --[span_247](start_span)[span_247](end_span)
-		status.Text = "หยุดแล้ว" --[span_248](start_span)[span_248](end_span)
-	end --[span_249](start_span)[span_249](end_span)
-end) --[span_250](start_span)[span_250](end_span)
+	if not ok or not cf then
+		local head = partOf(char, "Head")
+		local root = partOf(char, "HumanoidRootPart")
+		if not head or not root then return nil end
+		local a, aOn = project(head.Position + Vector3.new(0, 0.9, 0))
+		local b, bOn = project(root.Position - Vector3.new(0, 3.1, 0))
+		if not aOn or not bOn then return nil end
+		local h = math.abs(b.Y - a.Y)
+		local w = h * 0.55
+		return { x = (a.X + b.X) * 0.5 - w * 0.5, y = a.Y, w = w, h = h }
+	end
 
-print("[GLX Train+Race] โหลดแล้ว — กด START ALL") --[span_251](start_span)[span_251](end_span)
-print("[GLX] สถานีสูงสุดที่เข้าได้ตอนนี้: " .. tostring(bestStation())) --[span_252](start_span)[span_252](end_span)
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	local any = false
+	for _, sx in ipairs({ -0.5, 0.5 }) do
+		for _, sy in ipairs({ -0.5, 0.5 }) do
+			for _, sz in ipairs({ -0.5, 0.5 }) do
+				local wpos = (cf * CFrame.new(size.X * sx, size.Y * sy, size.Z * sz)).Position
+				local sp, on = project(wpos)
+				if on then
+					any = true
+					minX = math.min(minX, sp.X); maxX = math.max(maxX, sp.X)
+					minY = math.min(minY, sp.Y); maxY = math.max(maxY, sp.Y)
+				end
+			end
+		end
+	end
+	if not any then return nil end
+	if maxX - minX > 900 or maxY - minY > 1200 then return nil end -- degenerate projection
+	return { x = minX, y = minY, w = maxX - minX, h = maxY - minY }
+end
 
+local BONES_R15 = {
+	{ "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+	{ "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+	{ "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+	{ "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+	{ "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+}
+local BONES_R6 = {
+	{ "Head", "Torso" }, { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+	{ "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+}
+local function boneSet(char)
+	if char:FindFirstChild("UpperTorso") then return BONES_R15 end
+	if char:FindFirstChild("Torso") then return BONES_R6 end
+	return nil
+end
+
+---------------------------------------------------------------------------
+-- ESP slot: one bucket of Drawing objects per player, created lazily, hidden when idle
+---------------------------------------------------------------------------
+local SLOTS = {}
+
+local function newSlot()
+	return {
+		box = nil, fill = nil, name = nil, dist = nil, head = nil, tracer = nil,
+		hpBg = nil, hpFg = nil, bones = {}, boneRig = nil, chams = nil, char = nil,
+	}
+end
+
+local function ensure(slot)
+	if not HAS_DRAWING then return slot end
+	if not slot.box then
+		slot.box  = track(dnew("Square"))
+		slot.fill = track(dnew("Square"))
+		dset(slot.fill, { Filled = true, Color = CONFIG.esp.boxColor, Transparency = 0.85 })
+		slot.hpBg = track(dnew("Square"))
+		slot.hpFg = track(dnew("Square"))
+		dset(slot.hpBg, { Filled = true, Color = Color3.fromRGB(20, 20, 20), Transparency = 0.35 })
+	end
+	if not slot.name then
+		slot.name = track(dnew("Text"))
+		dset(slot.name, { Size = CONFIG.esp.textSize, Center = true, Outline = true, Color = Color3.fromRGB(240, 245, 250) })
+		slot.dist = track(dnew("Text"))
+		dset(slot.dist, { Size = CONFIG.esp.textSize - 2, Center = true, Outline = true, Color = Color3.fromRGB(215, 220, 230) })
+		slot.head = track(dnew("Circle"))
+		dset(slot.head, { Thickness = 1.5, Filled = true, Color = CONFIG.esp.enemyColor })
+		slot.tracer = track(dnew("Line"))
+		dset(slot.tracer, { Thickness = 1, Transparency = 0.35, Color = CONFIG.esp.enemyColor })
+	end
+	return slot
+end
+
+local function hideSlot(slot)
+	if not slot then return end
+	for _, o in ipairs({ slot.box, slot.fill, slot.hpBg, slot.hpFg, slot.name, slot.dist, slot.head, slot.tracer }) do
+		if o then pcall(function() o.Visible = false end) end
+	end
+	for _, b in ipairs(slot.bones) do pcall(function() b.Visible = false end) end
+	if slot.chams then pcall(function() slot.chams.Enabled = false end) end
+end
+
+local function freeSlot(slot)
+	if not slot then return end
+	for _, o in ipairs({ slot.box, slot.fill, slot.hpBg, slot.hpFg, slot.name, slot.dist, slot.head, slot.tracer }) do dfree(o) end
+	for _, b in ipairs(slot.bones) do dfree(b) end
+	if slot.chams then pcall(function() slot.chams:Destroy() end) end
+end
+
+local function ensureBones(slot, char)
+	local set = boneSet(char)
+	if not set then return end
+	if slot.boneRig ~= set then
+		for _, b in ipairs(slot.bones) do dfree(b) end
+		slot.bones = {}
+		slot.boneRig = set
+	end
+	while #slot.bones < #set do
+		local line = track(dnew("Line"))
+		dset(line, { Thickness = 1, Transparency = 0.2, Color = CONFIG.esp.boxColor })
+		table.insert(slot.bones, line)
+	end
+end
+
+local function ensureChams(slot, char)
+	if not CONFIG.esp.chams then
+		if slot.chams then pcall(function() slot.chams.Enabled = false end) end
+		return
+	end
+	if slot.chams and slot.chams.Parent ~= char then
+		pcall(function() slot.chams:Destroy() end)
+		slot.chams = nil
+	end
+	if not slot.chams then
+		local ok, hl = pcall(Instance.new, "Highlight")
+		if ok and hl then
+			hl.Name = "AX_Cham"
+			hl.FillColor = CONFIG.esp.enemyColor
+			hl.FillTransparency = 0.55
+			hl.OutlineColor = CONFIG.esp.boxColor
+			hl.OutlineTransparency = 0.7
+			hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			pcall(function() hl.Parent = char end)
+			slot.chams = hl
+		end
+	end
+	if slot.chams then pcall(function() slot.chams.Enabled = true end) end
+end
+
+---------------------------------------------------------------------------
+-- ESP draw pass
+---------------------------------------------------------------------------
+local function drawPlayer(plr, slot, cam)
+	local char = getChar(plr)
+	if not char or not alive(char) then hideSlot(slot); return end
+	slot.char = char
+
+	local root = partOf(char, "HumanoidRootPart")
+	local head = partOf(char, "Head")
+	if not root or not head then hideSlot(slot); return end
+
+	local camPos = cam.CFrame.Position
+	local dist = (root.Position - camPos).Magnitude
+	if dist > CONFIG.esp.maxDistance then hideSlot(slot); return end
+
+	local b = screenBounds(char)
+	if not b or b.w < 2 or b.h < 2 then hideSlot(slot); return end
+
+	if CONFIG.esp.teamCheck and isTeamMate(plr) then hideSlot(slot); return end
+	local col = CONFIG.esp.boxColor
+
+	ensure(slot)
+
+	-- box
+	dset(slot.box, { Visible = CONFIG.esp.box, Position = Vector2.new(b.x, b.y), Size = Vector2.new(b.w, b.h), Thickness = 1, Color = col, Filled = false })
+	dset(slot.fill, { Visible = CONFIG.esp.box and CONFIG.esp.fill, Position = Vector2.new(b.x, b.y), Size = Vector2.new(b.w, b.h), Color = col })
+
+	-- health bar (5px rail on the left edge)
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hp = hum and math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1) or 1
+	local barX, barW = b.x - 6, 3
+	dset(slot.hpBg, { Visible = CONFIG.esp.health, Position = Vector2.new(barX, b.y), Size = Vector2.new(barW, b.h) })
+	dset(slot.hpFg, {
+		Visible = CONFIG.esp.health,
+		Position = Vector2.new(barX, b.y + b.h * (1 - hp)),
+		Size = Vector2.new(barW, math.max(b.h * hp, 1)),
+		Color = Color3.fromRGB(math.floor(60 + 195 * (1 - hp)), math.floor(60 + 195 * hp), 90),
+	})
+
+	-- name + distance
+	dset(slot.name, { Visible = CONFIG.esp.name, Position = Vector2.new(b.x + b.w * 0.5, b.y - 14), Text = plr.Name, Color = col })
+	dset(slot.dist, { Visible = CONFIG.esp.distance, Position = Vector2.new(b.x + b.w * 0.5, b.y + b.h + 3), Text = string.format("%dm", math.floor(dist / 4)) })
+
+	-- head dot
+	local hp2, onHead = project(head.Position)
+	dset(slot.head, { Visible = CONFIG.esp.headDot and onHead, Position = hp2, Radius = math.max(b.w * 0.045, 1.5), Color = CONFIG.esp.enemyColor })
+
+	-- tracer from bottom-centre of the viewport
+	local vp = cam.ViewportSize
+	dset(slot.tracer, {
+		Visible = CONFIG.esp.tracer,
+		From = Vector2.new(vp.X * 0.5, vp.Y - 1),
+		To = Vector2.new(b.x + b.w * 0.5, b.y + b.h),
+		Color = CONFIG.esp.enemyColor,
+	})
+
+	-- skeleton
+	if CONFIG.esp.skeleton then
+		ensureBones(slot, char)
+		local set = slot.boneRig
+		for i, pair in ipairs(set or {}) do
+			local line = slot.bones[i]
+			local p1, p2 = partOf(char, pair[1]), partOf(char, pair[2])
+			if line and p1 and p2 then
+				local s1, o1 = project(p1.Position)
+				local s2, o2 = project(p2.Position)
+				dset(line, { Visible = o1 and o2, From = s1, To = s2, Color = col })
+			elseif line then
+				pcall(function() line.Visible = false end)
+			end
+		end
+		for i = #(set or {}) + 1, #slot.bones do pcall(function() slot.bones[i].Visible = false end) end
+	else
+		for _, line in ipairs(slot.bones) do pcall(function() line.Visible = false end) end
+	end
+
+	ensureChams(slot, char)
+end
+
+local function espPass()
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+
+	if not CONFIG.esp.enabled then
+		for _, slot in pairs(SLOTS) do hideSlot(slot) end
+		return
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			if anyTeamCheck() and isTeamMate(plr) then
+				if SLOTS[plr] then hideSlot(SLOTS[plr]) end
+			else
+				SLOTS[plr] = SLOTS[plr] or ensure(newSlot())
+				drawPlayer(plr, SLOTS[plr], cam)
+			end
+		end
+	end
+
+	-- reclaim slots for players that left
+	for plr, slot in pairs(SLOTS) do
+		if not plr.Parent then
+			freeSlot(slot)
+			SLOTS[plr] = nil
+		end
+	end
+end
+
+---------------------------------------------------------------------------
+-- target selection / visibility
+---------------------------------------------------------------------------
+local AIM = { holding = false, locked = false, pressedAt = 0, target = nil }
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local function hasLineOfSight(part, char)
+	local cam = Workspace.CurrentCamera
+	if not cam then return false end
+	local origin = cam.CFrame.Position
+	local filter = { char }
+	if LP.Character then table.insert(filter, LP.Character) end
+	rayParams.FilterDescendantsInstances = filter
+	local hit = Workspace:Raycast(origin, part.Position - origin, rayParams)
+	if not hit then return true end
+	return hit.Instance and hit.Instance:IsDescendantOf(char)
+end
+
+local function predictPoint(part, cam)
+	local pos = part.Position
+	local vel = part.AssemblyLinearVelocity or Vector3.zero
+	local dist = (pos - cam.CFrame.Position).Magnitude
+	local t
+	if CONFIG.aim.projectileSpeed > 0 then
+		t = dist / CONFIG.aim.projectileSpeed
+	else
+		t = CONFIG.aim.prediction
+	end
+	if t <= 0 then return pos end
+	local lead = Vector3.new(vel.X, vel.Y * 0.25, vel.Z) * t
+	if lead.Magnitude > 12 then lead = lead.Unit * 12 end -- sanity clamp for teleport-y rigs
+	return pos + lead
+end
+
+local function pickTarget(cam)
+	local center = Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
+	local best, bestScore = nil, math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP and not (CONFIG.aim.teamCheck and isTeamMate(plr)) then
+			local char = getChar(plr)
+			if char and alive(char) then
+				local part = partOf(char, CONFIG.aim.part) or partOf(char, "HumanoidRootPart")
+				if part and (part.Position - cam.CFrame.Position).Magnitude <= CONFIG.aim.maxDistance then
+					local sp, on = project(part.Position)
+					if on then
+						local score = (sp - center).Magnitude
+						if score <= CONFIG.aim.fov and score < bestScore then
+							if (not CONFIG.aim.visibleOnly) or hasLineOfSight(part, char) then
+								best = { plr = plr, char = char, part = part, screen = sp, score = score }
+								bestScore = score
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+---------------------------------------------------------------------------
+-- aim application
+---------------------------------------------------------------------------
+local fovCircle = nil
+if HAS_DRAWING then
+	fovCircle = dnew("Circle")
+	dset(fovCircle, { Thickness = 1, Transparency = 0.45, Filled = false, Color = CONFIG.esp.boxColor, Visible = false })
+end
+
+local lastTrigger = 0
+local function fireTrigger()
+	local gap = math.max(CONFIG.aim.triggerDelay, 0.02)
+	if now() - lastTrigger < gap then return end
+	lastTrigger = now()
+	if HAS_MOUSE1 then
+		pcall(mouse1click)
+	elseif VIM then
+		pcall(function()
+			VIM:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+			task.delay(0.02, function()
+				pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1) end)
+			end)
+		end)
+	end
+end
+
+local function mouseAim(aimPos)
+	local sp, on = project(aimPos)
+	if not on then return end
+	local cur = UIS:GetMouseLocation()
+	local dx = (sp.X - cur.X) * CONFIG.aim.smooth
+	local dy = (sp.Y - cur.Y) * CONFIG.aim.smooth
+	if CONFIG.aim.humanize then
+		dx = dx + (math.random() - 0.5) * 0.8
+		dy = dy + (math.random() - 0.5) * 0.8
+	end
+	if HAS_MOUSEREL then
+		pcall(mousemoverel, math.floor(dx + 0.5), math.floor(dy + 0.5))
+	elseif VIM then
+		pcall(function() VIM:SendMouseMoveEvent(cur.X + dx, cur.Y + dy, false) end)
+	end
+end
+
+local function aimEngaged()
+	if not CONFIG.aim.enabled then return false end
+	if CONFIG.aim.autoMobile and UIS.TouchEnabled and not UIS.KeyboardEnabled then return true end
+	if CONFIG.aim.lockToggle then return AIM.locked end
+	return AIM.holding
+end
+
+local function aimStep()
+	if not CONFIG.aim.enabled then AIM.target = nil; return end
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+
+	if not aimEngaged() then AIM.target = nil; return end
+	if now() - AIM.pressedAt < CONFIG.aim.reaction then return end
+
+	local t = pickTarget(cam)
+	AIM.target = t
+	if not t then return end
+
+	local aimPos = predictPoint(t.part, cam)
+	if CONFIG.aim.mode == "mouse" then
+		mouseAim(aimPos)
+	else
+		local cur = cam.CFrame
+		if (aimPos - cur.Position).Magnitude < 0.25 then return end
+		local desired = CFrame.lookAt(cur.Position, aimPos)
+		local alpha = CONFIG.aim.smooth
+		if CONFIG.aim.humanize then alpha = alpha * (0.88 + math.random() * 0.24) end
+		if alpha >= 0.999 then
+			cam.CFrame = desired
+		else
+			cam.CFrame = cur:Lerp(desired, math.clamp(alpha, 0.01, 1))
+		end
+	end
+
+	if CONFIG.aim.triggerbot then fireTrigger() end
+end
+
+local function updateFov()
+	if not fovCircle then return end
+	local cam = Workspace.CurrentCamera
+	if not cam then pcall(function() fovCircle.Visible = false end); return end
+	local vp = cam.ViewportSize
+	local show = aimEngaged()
+	pcall(function()
+		fovCircle.Position = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+		fovCircle.Radius = CONFIG.aim.fov
+		fovCircle.Color = AIM.target and CONFIG.esp.enemyColor or CONFIG.esp.boxColor
+		fovCircle.Visible = show
+	end)
+end
+
+---------------------------------------------------------------------------
+-- input
+---------------------------------------------------------------------------
+local function setEsp(v)
+	CONFIG.esp.enabled = v
+	if not v then
+		for _, slot in pairs(SLOTS) do hideSlot(slot) end
+	end
+end
+
+local function setAim(v)
+	CONFIG.aim.enabled = v
+	if not v then AIM.holding = false; AIM.locked = false end
+end
+
+table.insert(CONNS, UIS.InputBegan:Connect(function(input, gp)
+	if CONFIG.aim.key and input.UserInputType == CONFIG.aim.key then
+		if CONFIG.aim.lockToggle then
+			AIM.locked = not AIM.locked
+		else
+			AIM.holding = true
+		end
+		AIM.pressedAt = now()
+		return
+	end
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		setEsp(not CONFIG.esp.enabled)
+	elseif input.KeyCode == Enum.KeyCode.F then
+		CONFIG.aim.mode = (CONFIG.aim.mode == "camera") and "mouse" or "camera"
+	elseif input.KeyCode == Enum.KeyCode.LeftBracket then
+		CONFIG.aim.fov = math.max(20, CONFIG.aim.fov - 20)
+	elseif input.KeyCode == Enum.KeyCode.RightBracket then
+		CONFIG.aim.fov = math.min(1200, CONFIG.aim.fov + 20)
+	end
+end))
+
+table.insert(CONNS, UIS.InputEnded:Connect(function(input)
+	if CONFIG.aim.key and input.UserInputType == CONFIG.aim.key then
+		if not CONFIG.aim.lockToggle then AIM.holding = false end
+	end
+end))
+
+---------------------------------------------------------------------------
+-- touch-friendly panel (works with Delta on Android, mouse on PC)
+---------------------------------------------------------------------------
+local ACCENT = Color3.fromRGB(95, 255, 205)
+local PANEL_BG = Color3.fromRGB(14, 17, 22)
+local ROW_BG = Color3.fromRGB(24, 28, 35)
+
+local guiParent = nil
+pcall(function()
+	guiParent = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+end)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AX_HUD_" .. tostring(math.random(10000, 99999))
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 1000
+local parented = false
+if guiParent then parented = pcall(function() gui.Parent = guiParent end) end
+if not parented then pcall(function() gui.Parent = LP:WaitForChild("PlayerGui") end) end
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(198, 30 + 11 * 24 + 10)
+panel.Position = UDim2.new(1, -208, 0, 90)
+panel.BackgroundColor3 = PANEL_BG
+panel.BackgroundTransparency = 0.12
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Parent = gui
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = panel
+	local s = Instance.new("UIStroke"); s.Color = ACCENT; s.Transparency = 0.6; s.Thickness = 1; s.Parent = panel
+end
+
+local title = Instance.new("TextButton")
+title.Size = UDim2.new(1, 0, 0, 26)
+title.BackgroundTransparency = 1
+title.Text = "AX  ·  fov 220  sm .30"
+title.TextColor3 = ACCENT
+title.Font = Enum.Font.GothamBold
+title.TextSize = 12
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = panel
+title.Text = "  AX · fov 220 · sm .30"
+
+local list = Instance.new("Frame")
+list.Position = UDim2.fromOffset(6, 28)
+list.Size = UDim2.new(1, -12, 1, -34)
+list.BackgroundTransparency = 1
+list.Parent = panel
+do
+	local l = Instance.new("UIListLayout")
+	l.Padding = UDim.new(0, 2)
+	l.SortOrder = Enum.SortOrder.LayoutOrder
+	l.Parent = list
+end
+
+local SPECS = {}
+local function addSpec(label, action, order)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 22)
+	btn.BackgroundColor3 = ROW_BG
+	btn.BorderSizePixel = 0
+	btn.TextColor3 = Color3.fromRGB(228, 236, 244)
+	btn.Font = Enum.Font.GothamMedium
+	btn.TextSize = 12
+	btn.TextXAlignment = Enum.TextXAlignment.Left
+	btn.Text = "  " .. label
+	btn.LayoutOrder = order
+	do
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = btn
+	end
+	btn.Parent = list
+	btn.MouseButton1Click:Connect(function()
+		pcall(action)
+	end)
+	table.insert(SPECS, btn)
+	return btn
+end
+
+local function refreshAll()
+	local s = SPECS
+	local texts = {
+		"  ESP  [" .. (CONFIG.esp.enabled and "on" or "off") .. "]",
+		"  AIM  [" .. (CONFIG.aim.enabled and "on" or "off") .. "]",
+		"  MODE  " .. CONFIG.aim.mode,
+		"  TRIGGER  [" .. (CONFIG.aim.triggerbot and "on" or "off") .. "]",
+		"  SKELETON  [" .. (CONFIG.esp.skeleton and "on" or "off") .. "]",
+		"  CHAMS  [" .. (CONFIG.esp.chams and "on" or "off") .. "]",
+		"  TEAM CHECK  [" .. (CONFIG.esp.teamCheck and "on" or "off") .. "]",
+		"  FOV -20  (" .. CONFIG.aim.fov .. ")",
+		"  FOV +20  (" .. CONFIG.aim.fov .. ")",
+		"  SMOOTH -  (" .. string.format("%.2f", CONFIG.aim.smooth) .. ")",
+		"  SMOOTH +  (" .. string.format("%.2f", CONFIG.aim.smooth) .. ")",
+	}
+	for i, btn in ipairs(s) do
+		if texts[i] then btn.Text = texts[i] end
+	end
+	title.Text = "  AX · fov " .. CONFIG.aim.fov .. " · sm " .. string.format("%.2f", CONFIG.aim.smooth)
+end
+
+addSpec("ESP", function() setEsp(not CONFIG.esp.enabled); refreshAll() end, 1)
+addSpec("AIM", function() setAim(not CONFIG.aim.enabled); refreshAll() end, 2)
+addSpec("MODE", function()
+	CONFIG.aim.mode = (CONFIG.aim.mode == "camera") and "mouse" or "camera"
+	refreshAll()
+end, 3)
+addSpec("TRIG", function() CONFIG.aim.triggerbot = not CONFIG.aim.triggerbot; refreshAll() end, 4)
+addSpec("SKEL", function() CONFIG.esp.skeleton = not CONFIG.esp.skeleton; refreshAll() end, 5)
+addSpec("CHAM", function() CONFIG.esp.chams = not CONFIG.esp.chams; refreshAll() end, 6)
+addSpec("TEAM", function()
+	local v = not CONFIG.esp.teamCheck
+	CONFIG.esp.teamCheck = v
+	CONFIG.aim.teamCheck = v
+	refreshAll()
+end, 7)
+addSpec("FOV -", function() CONFIG.aim.fov = math.max(20, CONFIG.aim.fov - 20); refreshAll() end, 8)
+addSpec("FOV +", function() CONFIG.aim.fov = math.min(1200, CONFIG.aim.fov + 20); refreshAll() end, 9)
+addSpec("SM -", function() CONFIG.aim.smooth = math.clamp(CONFIG.aim.smooth - 0.05, 0.02, 1); refreshAll() end, 10)
+addSpec("SM +", function() CONFIG.aim.smooth = math.clamp(CONFIG.aim.smooth + 0.05, 0.02, 1); refreshAll() end, 11)
+
+refreshAll()
+
+-- drag (mouse + touch)
+local dragging, dragFrom, panelFrom = false, nil, nil
+table.insert(CONNS, title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragFrom = input.Position
+		panelFrom = panel.Position
+	end
+end))
+table.insert(CONNS, UIS.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local d = input.Position - dragFrom
+		panel.Position = UDim2.new(panelFrom.X.Scale, panelFrom.X.Offset + d.X, panelFrom.Y.Scale, panelFrom.Y.Offset + d.Y)
+	end
+end))
+table.insert(CONNS, UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end))
+
+---------------------------------------------------------------------------
+-- loops
+---------------------------------------------------------------------------
+local acc = 0
+table.insert(CONNS, RunService.Heartbeat:Connect(function(dt)
+	acc = acc + dt
+	if acc >= 1 / math.max(CONFIG.esp.updateRate, 10) then
+		acc = 0
+		espPass()
+	end
+end))
+
+RunService:BindToRenderStep("AX_AIM_STEP", Enum.RenderPriority.Camera.Value + 1, function()
+	aimStep()
+	updateFov()
+end)
+
+---------------------------------------------------------------------------
+-- cleanup
+---------------------------------------------------------------------------
+local function unload()
+	pcall(function() RunService:UnbindFromRenderStep("AX_AIM_STEP") end)
+	for _, c in ipairs(CONNS) do pcall(function() c:Disconnect() end) end
+	for _, slot in pairs(SLOTS) do freeSlot(slot) end
+	for _, d in ipairs(ALL_DRAWS) do dfree(d) end
+	if fovCircle then dfree(fovCircle) end
+	pcall(function() gui:Destroy() end)
+	CONNS = {}
+	_G.AX_UNLOAD = nil
+	local env = (type(getgenv) == "function" and getgenv()) or _G
+	if env then env.AX = nil end
+end
+
+_G.AX_UNLOAD = unload
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if env then env.AX = { config = CONFIG, unload = unload, aim = AIM } end
+
+print("[AX] aimbot + ESP armed · " .. LP.Name .. " · place " .. tostring(game.PlaceId))
+print("[AX] RMB = aim · RightShift = ESP · F = camera/mouse · [ ] = fov")
