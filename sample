@@ -605,11 +605,34 @@ table.insert(CONNS, UIS.InputEnded:Connect(function(input)
 end))
 
 ---------------------------------------------------------------------------
--- touch-friendly panel (works with Delta on Android, mouse on PC)
+-- GLX panel — collapsible header, draggable, touch-first
 ---------------------------------------------------------------------------
-local ACCENT = Color3.fromRGB(95, 255, 205)
-local PANEL_BG = Color3.fromRGB(14, 17, 22)
-local ROW_BG = Color3.fromRGB(24, 28, 35)
+local T = {
+	bg     = Color3.fromRGB(10, 13, 18),
+	head   = Color3.fromRGB(16, 21, 28),
+	row    = Color3.fromRGB(19, 25, 33),
+	hot    = Color3.fromRGB(27, 35, 45),
+	text   = Color3.fromRGB(226, 235, 243),
+	dim    = Color3.fromRGB(122, 138, 154),
+	accent = Color3.fromRGB(95, 255, 205),
+	off    = Color3.fromRGB(46, 56, 68),
+	ink    = Color3.fromRGB(8, 12, 16),
+}
+
+local TweenService = nil
+pcall(function() TweenService = game:GetService("TweenService") end)
+
+local function tween(inst, props, dur)
+	local ok = false
+	if TweenService and type(TweenInfo) == "table" then
+		ok = pcall(function()
+			TweenService:Create(inst, TweenInfo.new(dur or 0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+		end)
+	end
+	if not ok then
+		for k, v in pairs(props) do pcall(function() inst[k] = v end) end
+	end
+end
 
 local guiParent = nil
 pcall(function()
@@ -617,7 +640,7 @@ pcall(function()
 end)
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "AX_HUD_" .. tostring(math.random(10000, 99999))
+gui.Name = "GLX_HUD_" .. tostring(math.random(10000, 99999))
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.DisplayOrder = 1000
@@ -625,128 +648,366 @@ local parented = false
 if guiParent then parented = pcall(function() gui.Parent = guiParent end) end
 if not parented then pcall(function() gui.Parent = LP:WaitForChild("PlayerGui") end) end
 
+local PANEL_W, HEAD_H = 212, 32
+
 local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(198, 30 + 11 * 24 + 10)
-panel.Position = UDim2.new(1, -208, 0, 90)
-panel.BackgroundColor3 = PANEL_BG
-panel.BackgroundTransparency = 0.12
+panel.Size = UDim2.fromOffset(PANEL_W, HEAD_H)
+panel.Position = UDim2.new(1, -PANEL_W - 10, 0, 92)
+panel.BackgroundColor3 = T.bg
 panel.BorderSizePixel = 0
+panel.ClipsDescendants = true
 panel.Active = true
 panel.Parent = gui
 do
-	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = panel
-	local s = Instance.new("UIStroke"); s.Color = ACCENT; s.Transparency = 0.6; s.Thickness = 1; s.Parent = panel
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 10); c.Parent = panel
+	local s = Instance.new("UIStroke"); s.Color = T.accent; s.Transparency = 0.62; s.Thickness = 1; s.Parent = panel
+	local bar = Instance.new("Frame")
+	bar.Size = UDim2.new(1, 0, 0, 2)
+	bar.BackgroundColor3 = T.accent
+	bar.BackgroundTransparency = 0.25
+	bar.BorderSizePixel = 0
+	bar.Parent = panel
 end
 
-local title = Instance.new("TextButton")
-title.Size = UDim2.new(1, 0, 0, 26)
-title.BackgroundTransparency = 1
-title.Text = "AX  ·  fov 220  sm .30"
-title.TextColor3 = ACCENT
-title.Font = Enum.Font.GothamBold
-title.TextSize = 12
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = panel
-title.Text = "  AX · fov 220 · sm .30"
+-- header ---------------------------------------------------------------
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, HEAD_H)
+header.BackgroundColor3 = T.head
+header.BackgroundTransparency = 0.05
+header.BorderSizePixel = 0
+header.Active = true
+header.Parent = panel
 
-local list = Instance.new("Frame")
-list.Position = UDim2.fromOffset(6, 28)
-list.Size = UDim2.new(1, -12, 1, -34)
-list.BackgroundTransparency = 1
-list.Parent = panel
+local mark = Instance.new("TextLabel")
+mark.BackgroundTransparency = 1
+mark.Position = UDim2.fromOffset(12, 0)
+mark.Size = UDim2.fromOffset(46, HEAD_H)
+mark.Text = "GLX"
+mark.TextColor3 = T.accent
+mark.Font = Enum.Font.GothamBold
+mark.TextSize = 15
+mark.TextXAlignment = Enum.TextXAlignment.Left
+mark.Parent = header
+
+local dotAim = Instance.new("Frame")
+dotAim.Position = UDim2.fromOffset(58, 13)
+dotAim.Size = UDim2.fromOffset(6, 6)
+dotAim.BackgroundColor3 = T.accent
+dotAim.BorderSizePixel = 0
+dotAim.Parent = header
 do
-	local l = Instance.new("UIListLayout")
-	l.Padding = UDim.new(0, 2)
-	l.SortOrder = Enum.SortOrder.LayoutOrder
-	l.Parent = list
+	local d = Instance.new("UICorner"); d.CornerRadius = UDim.new(0.5, 0); d.Parent = dotAim
 end
 
-local SPECS = {}
-local function addSpec(label, action, order)
+local dotEsp = Instance.new("Frame")
+dotEsp.Position = UDim2.fromOffset(68, 13)
+dotEsp.Size = UDim2.fromOffset(6, 6)
+dotEsp.BackgroundColor3 = T.accent
+dotEsp.BorderSizePixel = 0
+dotEsp.Parent = header
+do
+	local d = Instance.new("UICorner"); d.CornerRadius = UDim.new(0.5, 0); d.Parent = dotEsp
+end
+
+local sub = Instance.new("TextLabel")
+sub.BackgroundTransparency = 1
+sub.Position = UDim2.fromOffset(80, 0)
+sub.Size = UDim2.new(1, -144, 1, 0)
+sub.Text = "aim · esp"
+sub.TextColor3 = T.dim
+sub.Font = Enum.Font.GothamMedium
+sub.TextSize = 10
+sub.TextXAlignment = Enum.TextXAlignment.Left
+sub.TextTruncate = Enum.TextTruncate.AtEnd
+sub.Parent = header
+
+local fold = Instance.new("TextButton")
+fold.AnchorPoint = Vector2.new(1, 0.5)
+fold.Position = UDim2.new(1, -6, 0.5, 0)
+fold.Size = UDim2.fromOffset(30, HEAD_H - 8)
+fold.BackgroundColor3 = T.hot
+fold.BackgroundTransparency = 0.35
+fold.BorderSizePixel = 0
+fold.Text = "▾"
+fold.TextColor3 = T.accent
+fold.Font = Enum.Font.GothamBold
+fold.TextSize = 14
+fold.AutoButtonColor = false
+fold.Parent = header
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = fold
+end
+
+-- body -----------------------------------------------------------------
+local body = Instance.new("Frame")
+body.Position = UDim2.fromOffset(0, HEAD_H)
+body.Size = UDim2.new(1, 0, 1, -HEAD_H)
+body.BackgroundTransparency = 1
+body.ClipsDescendants = true
+body.Parent = panel
+
+local ROWS = {}
+local refreshAll          -- forward declaration, assigned after the rows are built
+local cy = 6
+
+local function place(inst, height)
+	inst.Position = UDim2.fromOffset(8, cy)
+	inst.Size = UDim2.new(1, -16, 0, height)
+	cy = cy + height + 3
+end
+
+local function section(title)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Text = title
+	l.TextColor3 = T.dim
+	l.Font = Enum.Font.GothamBold
+	l.TextSize = 9
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = body
+	place(l, 13)
+end
+
+local function toggleRow(label, getState, onClick)
 	local btn = Instance.new("TextButton")
-	btn.Size = UDim2.new(1, 0, 0, 22)
-	btn.BackgroundColor3 = ROW_BG
+	btn.BackgroundColor3 = T.row
 	btn.BorderSizePixel = 0
-	btn.TextColor3 = Color3.fromRGB(228, 236, 244)
-	btn.Font = Enum.Font.GothamMedium
-	btn.TextSize = 12
-	btn.TextXAlignment = Enum.TextXAlignment.Left
-	btn.Text = "  " .. label
-	btn.LayoutOrder = order
+	btn.Text = ""
+	btn.AutoButtonColor = false
+	btn.Parent = body
 	do
-		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = btn
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
 	end
-	btn.Parent = list
+
+	local name = Instance.new("TextLabel")
+	name.BackgroundTransparency = 1
+	name.Position = UDim2.fromOffset(10, 0)
+	name.Size = UDim2.new(1, -72, 1, 0)
+	name.Text = label
+	name.TextColor3 = T.text
+	name.Font = Enum.Font.GothamMedium
+	name.TextSize = 12
+	name.TextXAlignment = Enum.TextXAlignment.Left
+	name.Parent = btn
+
+	local pillBg = Instance.new("Frame")
+	pillBg.AnchorPoint = Vector2.new(1, 0.5)
+	pillBg.Position = UDim2.new(1, -8, 0.5, 0)
+	pillBg.Size = UDim2.fromOffset(46, 16)
+	pillBg.BackgroundColor3 = T.off
+	pillBg.BorderSizePixel = 0
+	pillBg.Parent = btn
+	do
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0.5, 0); c.Parent = pillBg
+	end
+
+	local pillText = Instance.new("TextLabel")
+	pillText.Size = UDim2.fromScale(1, 1)
+	pillText.BackgroundTransparency = 1
+	pillText.Text = "OFF"
+	pillText.TextColor3 = T.dim
+	pillText.Font = Enum.Font.GothamBold
+	pillText.TextSize = 9
+	pillText.Parent = pillBg
+
 	btn.MouseButton1Click:Connect(function()
-		pcall(action)
+		onClick()
+		refreshAll()
 	end)
-	table.insert(SPECS, btn)
-	return btn
+	place(btn, 24)
+
+	table.insert(ROWS, function()
+		local st = getState()
+		pillText.Text = st.text
+		pillBg.BackgroundColor3 = st.on and T.accent or T.off
+		pillText.TextColor3 = st.on and T.ink or T.dim
+		name.TextColor3 = st.on and Color3.fromRGB(240, 255, 250) or T.text
+	end)
 end
 
-local function refreshAll()
-	local s = SPECS
-	local texts = {
-		"  ESP  [" .. (CONFIG.esp.enabled and "on" or "off") .. "]",
-		"  AIM  [" .. (CONFIG.aim.enabled and "on" or "off") .. "]",
-		"  MODE  " .. CONFIG.aim.mode,
-		"  TRIGGER  [" .. (CONFIG.aim.triggerbot and "on" or "off") .. "]",
-		"  SKELETON  [" .. (CONFIG.esp.skeleton and "on" or "off") .. "]",
-		"  CHAMS  [" .. (CONFIG.esp.chams and "on" or "off") .. "]",
-		"  TEAM CHECK  [" .. (CONFIG.esp.teamCheck and "on" or "off") .. "]",
-		"  FOV -20  (" .. CONFIG.aim.fov .. ")",
-		"  FOV +20  (" .. CONFIG.aim.fov .. ")",
-		"  SMOOTH -  (" .. string.format("%.2f", CONFIG.aim.smooth) .. ")",
-		"  SMOOTH +  (" .. string.format("%.2f", CONFIG.aim.smooth) .. ")",
-	}
-	for i, btn in ipairs(s) do
-		if texts[i] then btn.Text = texts[i] end
+local function stepperRow(label, getValue, onDec, onInc)
+	local box = Instance.new("Frame")
+	box.BackgroundColor3 = T.row
+	box.BorderSizePixel = 0
+	box.Parent = body
+	do
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = box
 	end
-	title.Text = "  AX · fov " .. CONFIG.aim.fov .. " · sm " .. string.format("%.2f", CONFIG.aim.smooth)
+
+	local name = Instance.new("TextLabel")
+	name.BackgroundTransparency = 1
+	name.Position = UDim2.fromOffset(10, 0)
+	name.Size = UDim2.new(1, -110, 1, 0)
+	name.Text = label
+	name.TextColor3 = T.text
+	name.Font = Enum.Font.GothamMedium
+	name.TextSize = 12
+	name.TextXAlignment = Enum.TextXAlignment.Left
+	name.Parent = box
+
+	local val = Instance.new("TextLabel")
+	val.AnchorPoint = Vector2.new(1, 0.5)
+	val.Position = UDim2.new(1, -66, 0.5, 0)
+	val.Size = UDim2.fromOffset(58, 18)
+	val.BackgroundTransparency = 1
+	val.Text = tostring(getValue())
+	val.TextColor3 = T.accent
+	val.Font = Enum.Font.GothamBold
+	val.TextSize = 11
+	val.TextXAlignment = Enum.TextXAlignment.Right
+	val.Parent = box
+
+	local function tinyBtn(offsetX, glyph, action)
+		local b = Instance.new("TextButton")
+		b.AnchorPoint = Vector2.new(1, 0.5)
+		b.Position = UDim2.new(1, offsetX, 0.5, 0)
+		b.Size = UDim2.fromOffset(26, 18)
+		b.BackgroundColor3 = T.hot
+		b.BorderSizePixel = 0
+		b.Text = glyph
+		b.TextColor3 = T.accent
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 13
+		b.AutoButtonColor = false
+		b.Parent = box
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = b
+		b.MouseButton1Click:Connect(function()
+			action()
+			refreshAll()
+		end)
+		return b
+	end
+	tinyBtn(-38, "−", onDec)
+	tinyBtn(-8, "+", onInc)
+
+	place(box, 24)
+	table.insert(ROWS, function()
+		val.Text = tostring(getValue())
+	end)
 end
 
-addSpec("ESP", function() setEsp(not CONFIG.esp.enabled); refreshAll() end, 1)
-addSpec("AIM", function() setAim(not CONFIG.aim.enabled); refreshAll() end, 2)
-addSpec("MODE", function()
+---------------------------------------------------------------------------
+-- rows
+---------------------------------------------------------------------------
+section("TARGETING")
+toggleRow("Aimbot", function()
+	return { text = CONFIG.aim.enabled and "ON" or "OFF", on = CONFIG.aim.enabled }
+end, function() setAim(not CONFIG.aim.enabled) end)
+
+toggleRow("Aim mode", function()
+	local cam = CONFIG.aim.mode == "camera"
+	return { text = cam and "CAM" or "MOUSE", on = true }
+end, function()
 	CONFIG.aim.mode = (CONFIG.aim.mode == "camera") and "mouse" or "camera"
-	refreshAll()
-end, 3)
-addSpec("TRIG", function() CONFIG.aim.triggerbot = not CONFIG.aim.triggerbot; refreshAll() end, 4)
-addSpec("SKEL", function() CONFIG.esp.skeleton = not CONFIG.esp.skeleton; refreshAll() end, 5)
-addSpec("CHAM", function() CONFIG.esp.chams = not CONFIG.esp.chams; refreshAll() end, 6)
-addSpec("TEAM", function()
+end)
+
+toggleRow("Triggerbot", function()
+	return { text = CONFIG.aim.triggerbot and "ON" or "OFF", on = CONFIG.aim.triggerbot }
+end, function() CONFIG.aim.triggerbot = not CONFIG.aim.triggerbot end)
+
+stepperRow("FOV", function() return CONFIG.aim.fov end,
+	function() CONFIG.aim.fov = math.max(20, CONFIG.aim.fov - 20) end,
+	function() CONFIG.aim.fov = math.min(1200, CONFIG.aim.fov + 20) end)
+
+stepperRow("Smooth", function() return string.format("%.2f", CONFIG.aim.smooth) end,
+	function() CONFIG.aim.smooth = math.clamp(CONFIG.aim.smooth - 0.05, 0.02, 1) end,
+	function() CONFIG.aim.smooth = math.clamp(CONFIG.aim.smooth + 0.05, 0.02, 1) end)
+
+section("VISUALS")
+toggleRow("ESP", function()
+	return { text = CONFIG.esp.enabled and "ON" or "OFF", on = CONFIG.esp.enabled }
+end, function() setEsp(not CONFIG.esp.enabled) end)
+
+toggleRow("Skeleton", function()
+	return { text = CONFIG.esp.skeleton and "ON" or "OFF", on = CONFIG.esp.skeleton }
+end, function() CONFIG.esp.skeleton = not CONFIG.esp.skeleton end)
+
+toggleRow("Chams", function()
+	return { text = CONFIG.esp.chams and "ON" or "OFF", on = CONFIG.esp.chams }
+end, function() CONFIG.esp.chams = not CONFIG.esp.chams end)
+
+toggleRow("Team check", function()
+	return { text = CONFIG.esp.teamCheck and "ON" or "OFF", on = CONFIG.esp.teamCheck }
+end, function()
 	local v = not CONFIG.esp.teamCheck
 	CONFIG.esp.teamCheck = v
 	CONFIG.aim.teamCheck = v
+end)
+
+section("SYSTEM")
+toggleRow("Unload script", function()
+	return { text = "EXIT", on = false }
+end, function()
+	if _G.AX_UNLOAD then _G.AX_UNLOAD() end
+end)
+
+---------------------------------------------------------------------------
+-- state + fold
+---------------------------------------------------------------------------
+local FULL_H = HEAD_H + cy + 4
+local collapsed = false
+
+function refreshAll()
+	for _, f in ipairs(ROWS) do pcall(f) end
+	pcall(function()
+		dotAim.BackgroundColor3 = CONFIG.aim.enabled and T.accent or T.off
+		dotEsp.BackgroundColor3 = CONFIG.esp.enabled and T.accent or T.off
+		if collapsed then
+			local a, e = CONFIG.aim.enabled, CONFIG.esp.enabled
+			sub.Text = (a and e) and "aim · esp" or (a and "aim" or (e and "esp" or "idle"))
+		else
+			sub.Text = "fov " .. CONFIG.aim.fov .. " · sm " .. string.format("%.2f", CONFIG.aim.smooth)
+		end
+	end)
+end
+
+local function setCollapsed(v)
+	collapsed = v
+	body.Visible = not v
+	fold.Text = v and "▸" or "▾"
+	tween(panel, { Size = UDim2.fromOffset(PANEL_W, v and HEAD_H or FULL_H) })
 	refreshAll()
-end, 7)
-addSpec("FOV -", function() CONFIG.aim.fov = math.max(20, CONFIG.aim.fov - 20); refreshAll() end, 8)
-addSpec("FOV +", function() CONFIG.aim.fov = math.min(1200, CONFIG.aim.fov + 20); refreshAll() end, 9)
-addSpec("SM -", function() CONFIG.aim.smooth = math.clamp(CONFIG.aim.smooth - 0.05, 0.02, 1); refreshAll() end, 10)
-addSpec("SM +", function() CONFIG.aim.smooth = math.clamp(CONFIG.aim.smooth + 0.05, 0.02, 1); refreshAll() end, 11)
+end
 
-refreshAll()
+fold.MouseButton1Click:Connect(function() setCollapsed(not collapsed) end)
 
--- drag (mouse + touch)
+-- drag + clamp (mouse and touch)
 local dragging, dragFrom, panelFrom = false, nil, nil
-table.insert(CONNS, title.InputBegan:Connect(function(input)
+
+local function clampPosition(px, py)
+	local cam = Workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1080, 1920)
+	local w = (collapsed and PANEL_W or PANEL_W)
+	local h = collapsed and HEAD_H or FULL_H
+	px = math.clamp(px, 0, math.max(vp.X - w, 0))
+	py = math.clamp(py, 0, math.max(vp.Y - h - 12, 0))
+	return px, py
+end
+
+table.insert(CONNS, header.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = true
 		dragFrom = input.Position
-		panelFrom = panel.Position
+		panelFrom = panel.AbsolutePosition or Vector2.new(0, 0)
 	end
 end))
+
 table.insert(CONNS, UIS.InputChanged:Connect(function(input)
 	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 		local d = input.Position - dragFrom
-		panel.Position = UDim2.new(panelFrom.X.Scale, panelFrom.X.Offset + d.X, panelFrom.Y.Scale, panelFrom.Y.Offset + d.Y)
+		local px, py = clampPosition(panelFrom.X + d.X, panelFrom.Y + d.Y)
+		panel.Position = UDim2.fromOffset(px, py)
 	end
 end))
+
 table.insert(CONNS, UIS.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = false
 	end
 end))
+
+panel.Size = UDim2.fromOffset(PANEL_W, FULL_H)
+refreshAll()
 
 ---------------------------------------------------------------------------
 -- loops
