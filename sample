@@ -1,1190 +1,341 @@
--- language: Luau, file: muaythai_evo.lua, target: [BOSS] +1 Muay Thai Evolution (place 133081981709881)
--- Auto-train / economy driver. Everything runs client-side: clicks go through VirtualUser,
--- prompts are held through ProximityPrompt API, remotes are fired only after the scout proves
--- which one actually moves a stat (delta detection). No blind remote spam.
+-- silent_aim_mobile.lua — Silent Aim (camera-based) for mobile/Delta
+-- Designed for ACS-based FPS (place 118367369949006). Tested schema:
+--   Teams: Mercenaries / Task Force (Joining ignored)
+--   R15: Head, UpperTorso, HumanoidRootPart
+--   Camera: Custom, CFrame writable, touch-only
+--   Executor: Drawing, gethui, hookmetamethod available
 --
--- loader:
---   local b = game:HttpGet("https://textdb.dev/api/data/glx-bridge-9f2s")
---   loadstring(game:HttpGet(b .. "/scripts/muaythai_evo.lua"))()
+-- Usage (Delta): loadstring(game:HttpGet("<bridge>/scripts/silent_aim_mobile.lua"))()
+-- Toggle: tap the on-screen [AIM] button (top-left) or _G.SAIM.setEnabled(bool)
+-- Unload: _G.SAIM.unload()
 
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local UIS          = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local CoreGuiSvc   = game:GetService("CoreGui")
-local RS           = game:GetService("ReplicatedStorage")
-local LP           = Players.LocalPlayer
+if _G.SAIM and _G.SAIM.unload then pcall(_G.SAIM.unload) end
 
-local ok_vim, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
-if not ok_vim then VIM = nil end
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Teams = game:GetService("Teams")
+local LP = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
 
-local genv = (type(getgenv) == "function" and getgenv()) or _G
-if genv.GLX_MT_UNLOAD then pcall(genv.GLX_MT_UNLOAD) end
-
----------------------------------------------------------------------------
--- config / state
----------------------------------------------------------------------------
-local CONFIG = {
-	train = {
-		enabled     = false,
-		cps         = 14,          -- clicks per second, tap-hold safe range 8..20
-		face        = true,        -- point camera at the dummy so the click lands on it
-		warp        = false,       -- snap the character next to the dummy first
-		warpRange   = 9,
-		useTool     = true,        -- activate equipped tool in addition to clicking
-		clickRange  = 260,         -- studs; dummies farther than this are ignored
-		nameFilter  = "dummy|bag|train|punch|target|kru|boss",
-	},
-	economy = {
-		rebirth     = false,
-		rebirthMin  = 1000,        -- fire rebirth once the fury-like stat passes this
-		rebirthEvery = 2,          -- seconds between rebirth attempts
-		claim       = false,
-		claimEvery  = 8,
-	},
-	system = {
-		antiafk     = true,
-		afkEvery    = 45,
-		scanEvery   = 0,           -- 0 = manual rescan only
-	},
+local CFG = {
+    Enabled = true,
+    TeamCheck = true,
+    WallCheck = true,
+    FOV = 180,              -- pixels radius from screen center (800x450 viewport)
+    ShowFOV = true,
+    Smooth = 0.35,          -- 0..1 lerp per frame (lower = smoother/"more silent")
+    AimPart = "Head",       -- "Head" or "HumanoidRootPart" or "UpperTorso"
+    MaxDist = 1500,
+    Prediction = 0,         -- studs/sec * seconds (0 = off; set small if needed)
+    RequireAlive = true,
+    Sticky = true,          -- keep current target while valid
+    StickyBreakFOV = 1.6,   -- multiplier to drop sticky target
+    MinHealth = 1,
 }
 
-local STATE = {
-	dummies      = {},
-	remotes      = {},
-	prompts      = {},
-	candidates   = {},   -- probed remotes, ranked
-	bind         = { train = nil, rebirth = nil, claim = nil, buy = nil },
-	stats        = {},
-	counters     = { clicks = 0, rebirths = 0, claims = 0, warps = 0 },
-	timers       = { dummy = 0, stats = 0, rebirth = 0, claim = 0, afk = 0 },
-	dummy        = nil,
-	acc          = 0,
-	running      = true,
+local state = {
+    target = nil,
+    targetName = nil,
+    lastAngle = math.huge,
+    conns = {},
+    drawing = {},
+    gui = nil,
 }
 
----------------------------------------------------------------------------
--- keywords — the scout classifies by name, then proves by delta
----------------------------------------------------------------------------
-local KW = {
-	train   = "hit|punch|attack|train|tap|click|strike|fury",
-	rebirth = "rebirth|prestige|reset|ascend|evolve|temple|reincarn",
-	buy     = "buy|purchase|upgrade|unlock|equip|open|spin|crate|shorts|mongkol",
-	claim   = "claim|reward|daily|gift|bonus|code|collect|redeem",
+local function safe(f, d)
+    local ok, v = pcall(f)
+    if ok then return v end
+    return d
+end
+
+local function getTeamName(plr)
+    local t = safe(function() return plr.Team end, nil)
+    if t then
+        local n = safe(function() return t.Name end, nil)
+        if n and n ~= "" then return n end
+    end
+    return nil
+end
+
+local function myTeam()
+    return getTeamName(LP)
+end
+
+local function isEnemy(plr)
+    if plr == LP then return false end
+    local tn = getTeamName(plr)
+    if not tn or tn == "" or tn == "Joining" then
+        -- treat as non-target if no real team
+        if CFG.TeamCheck then return false end
+    end
+    if CFG.TeamCheck then
+        local mine = myTeam()
+        if mine and tn and mine == tn then return false end
+        -- if either side unknown, be conservative
+        if not mine or not tn then return false end
+    end
+    return true
+end
+
+local function getChar(plr)
+    local ch = safe(function() return plr.Character end, nil)
+    if not ch then return nil end
+    local hum = ch:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    if CFG.RequireAlive and hum.Health <= (CFG.MinHealth or 1) then return nil end
+    return ch, hum
+end
+
+local function getAimPart(ch)
+    local p = ch:FindFirstChild(CFG.AimPart) or ch:FindFirstChild("Head") or ch:FindFirstChild("UpperTorso") or ch:FindFirstChild("HumanoidRootPart")
+    if p and p:IsA("BasePart") then return p end
+    return nil
+end
+
+local function worldToScreen(pos)
+    local v, on = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(v.X, v.Y), on and v.Z > 0, v.Z
+end
+
+local function screenCenter()
+    local vp = Camera.ViewportSize
+    return Vector2.new(vp.X / 2, vp.Y / 2)
+end
+
+local function isVisible(origin, targetPos, targetChar)
+    if not CFG.WallCheck then return true end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local exclude = {safe(function() return LP.Character end, nil), Camera}
+    params.FilterDescendantsInstances = exclude
+    params.IgnoreWater = true
+    local dir = targetPos - origin
+    local res = workspace:Raycast(origin, dir, params)
+    if not res then return true end
+    local inst = res.Instance
+    if inst and targetChar and inst:IsDescendantOf(targetChar) then return true end
+    -- allow thin/translucent accessories? mostly ignore, but be permissive to reduce false blocks
+    if inst and inst:IsA("BasePart") then
+        if inst.Transparency >= 0.8 or inst.CanCollide == false then
+            -- try again excluding hit part's model-ish? simple: accept borderline transparent
+            return false
+        end
+    end
+    return false
+end
+
+local function predictPos(part, plr)
+    if (CFG.Prediction or 0) <= 0 then return part.Position end
+    local vel = safe(function() return part.AssemblyLinearVelocity end, Vector3.zero) or Vector3.zero
+    -- damp vertical prediction a bit
+    vel = Vector3.new(vel.X, vel.Y * 0.3, vel.Z)
+    return part.Position + vel * CFG.Prediction
+end
+
+local function validTarget(plr)
+    if not isEnemy(plr) then return nil end
+    local ch, hum = getChar(plr)
+    if not ch or not hum then return nil end
+    local part = getAimPart(ch)
+    if not part then return nil end
+    local aimPos = predictPos(part, plr)
+    local sc, on, depth = worldToScreen(aimPos)
+    if not on then return nil end
+    local center = screenCenter()
+    local dist2d = (sc - center).Magnitude
+    local dist3d = (aimPos - Camera.CFrame.Position).Magnitude
+    if dist3d > CFG.MaxDist then return nil end
+    local vis = isVisible(Camera.CFrame.Position, aimPos, ch)
+    if CFG.WallCheck and not vis then return nil end
+    return {
+        plr = plr, ch = ch, hum = hum, part = part,
+        aimPos = aimPos, screen = sc, dist2d = dist2d, dist3d = dist3d
+    }
+end
+
+local function pickTarget()
+    -- sticky
+    if CFG.Sticky and state.target then
+        local okPlr = state.target
+        if okPlr and okPlr.Parent == Players then
+            local vt = validTarget(okPlr)
+            if vt and vt.dist2d <= CFG.FOV * (CFG.StickyBreakFOV or 1.5) then
+                return vt
+            end
+        end
+        state.target = nil
+    end
+
+    local best, bestD = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local vt = validTarget(plr)
+        if vt and vt.dist2d <= CFG.FOV and vt.dist2d < bestD then
+            best, bestD = vt, vt.dist2d
+        end
+    end
+    if best and CFG.Sticky then state.target = best.plr end
+    return best
+end
+
+local function aimAt(pos)
+    local camPos = Camera.CFrame.Position
+    local desired = CFrame.lookAt(camPos, pos)
+    local s = math.clamp(CFG.Smooth or 0.35, 0.01, 1)
+    Camera.CFrame = Camera.CFrame:Lerp(desired, s)
+    local curLook = Camera.CFrame.LookVector
+    local want = (pos - camPos)
+    if want.Magnitude > 1e-3 then
+        state.lastAngle = math.deg(math.acos(math.clamp(curLook:Dot(want.Unit), -1, 1)))
+    end
+end
+
+-- Drawing FOV circle
+local function setupDrawing()
+    local ok = pcall(function()
+        if type(Drawing) ~= "table" and type(Drawing) ~= "userdata" then return end
+        local c = Drawing.new("Circle")
+        c.Thickness = 1.5
+        c.NumSides = 64
+        c.Filled = false
+        c.Transparency = 0.9
+        c.Color = Color3.fromRGB(255, 80, 80)
+        c.Visible = false
+        state.drawing.fov = c
+    end)
+    if not ok then state.drawing.fov = nil end
+end
+
+local function updateFOV()
+    local c = state.drawing.fov
+    if not c then return end
+    c.Visible = CFG.ShowFOV and CFG.Enabled
+    if c.Visible then
+        c.Position = screenCenter()
+        c.Radius = CFG.FOV
+        c.Color = state.targetName and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(255, 80, 80)
+    end
+end
+
+-- Toggle GUI (mobile)
+local function setupGUI()
+    local parent = nil
+    pcall(function() if type(gethui)=="function" then parent = gethui() end end)
+    if not parent then
+        local ok, pg = pcall(function() return LP:WaitForChild("PlayerGui", 2) end)
+        if ok then parent = pg end
+    end
+    if not parent then return end
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "SAIM_GUI"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    pcall(function() sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
+    sg.Parent = parent
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "Toggle"
+    btn.Size = UDim2.new(0, 72, 0, 32)
+    btn.Position = UDim2.new(0, 10, 0, 60)
+    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    btn.BackgroundTransparency = 0.25
+    btn.BorderSizePixel = 0
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 14
+    btn.AutoButtonColor = true
+    btn.Parent = sg
+    local corner = Instance.new("UICorner", btn); corner.CornerRadius = UDim.new(0,8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Name = "Status"
+    lbl.Size = UDim2.new(0, 220, 0, 18)
+    lbl.Position = UDim2.new(0, 10, 0, 96)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(230,230,230)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = ""
+    lbl.Parent = sg
+
+    state.gui = {sg=sg, btn=btn, lbl=lbl}
+
+    local function refreshBtn()
+        if CFG.Enabled then
+            btn.Text = "AIM: ON"
+            btn.BackgroundColor3 = Color3.fromRGB(20, 90, 40)
+        else
+            btn.Text = "AIM: OFF"
+            btn.BackgroundColor3 = Color3.fromRGB(90, 30, 30)
+        end
+    end
+    refreshBtn()
+
+    btn.MouseButton1Click:Connect(function()
+        CFG.Enabled = not CFG.Enabled
+        if not CFG.Enabled then state.target=nil; state.targetName=nil end
+        refreshBtn()
+    end)
+
+    state.gui.refreshBtn = refreshBtn
+end
+
+local function mainStep()
+    if not Camera then Camera = workspace.CurrentCamera end
+    if not Camera then return end
+    updateFOV()
+    if not CFG.Enabled then
+        state.targetName = nil
+        if state.gui and state.gui.lbl then state.gui.lbl.Text = "off" end
+        return
+    end
+    local vt = pickTarget()
+    if vt then
+        state.targetName = vt.plr.Name
+        aimAt(vt.aimPos)
+        if state.gui and state.gui.lbl then
+            state.gui.lbl.Text = string.format("%s | %.0fpx | %.0fm | %.1f°", vt.plr.Name, vt.dist2d, vt.dist3d, state.lastAngle or 0)
+        end
+    else
+        state.targetName = nil
+        if state.gui and state.gui.lbl then state.gui.lbl.Text = "no target" end
+    end
+end
+
+setupDrawing()
+setupGUI()
+state.conns.render = RunService.RenderStepped:Connect(mainStep)
+
+_G.SAIM = {
+    CFG = CFG,
+    state = state,
+    setEnabled = function(v)
+        CFG.Enabled = not not v
+        if state.gui and state.gui.refreshBtn then state.gui.refreshBtn() end
+    end,
+    setFOV = function(v) CFG.FOV = tonumber(v) or CFG.FOV end,
+    setSmooth = function(v) CFG.Smooth = tonumber(v) or CFG.Smooth end,
+    status = function()
+        return {
+            enabled = CFG.Enabled,
+            target = state.targetName,
+            angle = state.lastAngle,
+            team = getTeamName(LP),
+            fov = CFG.FOV,
+            smooth = CFG.Smooth,
+            vp = tostring(Camera and Camera.ViewportSize),
+        }
+    end,
+    unload = function()
+        CFG.Enabled = false
+        for _,c in pairs(state.conns) do pcall(function() c:Disconnect() end) end
+        state.conns = {}
+        pcall(function() if state.drawing.fov then state.drawing.fov:Remove() end end)
+        pcall(function() if state.gui and state.gui.sg then state.gui.sg:Destroy() end end)
+        _G.SAIM = nil
+    end,
 }
 
----------------------------------------------------------------------------
--- utils
----------------------------------------------------------------------------
-local function lower(s) return string.lower(tostring(s or "")) end
--- Lua patterns have no alternation: split on '|' and run literal finds
-local function hit(name, pattern)
-	if not name or not pattern then return false end
-	local s = lower(name)
-	for word in string.gmatch(pattern, "[^|]+") do
-		if string.find(s, word, 1, true) then return true end
-	end
-	return false
-end
-
-local unpack_ = table.unpack or unpack
-
-local function log(fmt, ...)
-	local ok, line = pcall(string.format, fmt, ...)
-	print("[GLX-MT] " .. (ok and line or tostring(fmt)))
-end
-
-local function safe(fn, ...)
-	local ok, res = pcall(fn, ...)
-	if ok then return res end
-	return nil
-end
-
-local function statNumber(v)
-	if type(v) == "number" then return v end
-	if type(v) == "string" then
-		local n = tonumber(v:gsub("[,%s]", ""))
-		return n
-	end
-	return nil
-end
-
--- position of any instance that could be a dummy/character
-local function getPos(inst)
-	if not inst then return nil end
-	local p = safe(function() return inst:GetPivot().Position end)
-	if p then return p end
-	local prim = rawget(inst, "PrimaryPart")
-	if prim and prim.Position then return prim.Position end
-	local part = safe(function() return inst:FindFirstChildOfClass("BasePart") end)
-	if not part then part = safe(function() return inst:FindFirstChild("HumanoidRootPart") end) end
-	if not part then part = safe(function() return inst:FindFirstChildOfClass("Part") end) end
-	if part and part.Position then return part.Position end
-	local cf = safe(function() return inst:GetBoundingBox() end)
-	if cf and cf.Position then return cf.Position end
-	local pos = rawget(inst, "Position")
-	if pos then return pos end
-	return nil
-end
-
-local function dist(a, b)
-	if not a or not b then return math.huge end
-	local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
-	return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-
-local function myPos()
-	if not LP then return nil end
-	local char = rawget(LP, "Character")
-	if not char then return nil end
-	local root = safe(function() return char:FindFirstChild("HumanoidRootPart") end)
-	if root and root.Position then return root.Position end
-	return getPos(char)
-end
-
-local function rootPart()
-	local char = LP and rawget(LP, "Character")
-	if not char then return nil end
-	return safe(function() return char:FindFirstChild("HumanoidRootPart") end)
-end
-
-local function humanoid()
-	local char = LP and rawget(LP, "Character")
-	if not char then return nil end
-	return safe(function() return char:FindFirstChildOfClass("Humanoid") end)
-end
-
----------------------------------------------------------------------------
--- stats — every numeric value hanging off the player, diffed for proof
----------------------------------------------------------------------------
-local function collectStats()
-	local out = {}
-	if not LP then return out end
-	local function eat(inst, prefix, depth)
-		if depth > 3 then return end
-		local children = safe(function() return inst:GetChildren() end) or {}
-		for _, child in ipairs(children) do
-			local cn = child.ClassName
-			if cn == "IntValue" or cn == "NumberValue" or cn == "StringValue" then
-				out[prefix .. tostring(child.Name)] = rawget(child, "Value")
-			elseif cn == "Folder" then
-				eat(child, prefix .. tostring(child.Name) .. ".", depth + 1)
-			end
-		end
-	end
-	eat(LP, "", 0)
-	return out
-end
-
--- total of every numeric stat: one number that moves when anything pays out
-local function statTotal(stats)
-	local total = 0
-	for _, v in pairs(stats or {}) do
-		local n = statNumber(v)
-		if n then total = total + n end
-	end
-	return total
-end
-
-local function statDiff(before, after)
-	local lines = {}
-	for k, v in pairs(after or {}) do
-		local n = statNumber(v)
-		local o = statNumber((before or {})[k])
-		if n and (o == nil or n ~= o) then
-			local d = n - (o or 0)
-			local sign = d >= 0 and "+" or ""
-			lines[#lines + 1] = string.format("%s %s%s", k, sign, tostring(math.floor(d * 100) / 100))
-		end
-	end
-	table.sort(lines)
-	return lines
-end
-
-local function furyStat()
-	local best, bestKey = nil, nil
-	local keys = {}
-	for k, v in pairs(STATE.stats or {}) do keys[#keys + 1] = k end
-	table.sort(keys)
-	for _, k in ipairs(keys) do
-		local v = statNumber(STATE.stats[k])
-		if v and hit(k, "fury|might|power|strength|point|force") then
-			if not best or v > best then best, bestKey = v, k end
-		end
-	end
-	return best, bestKey
-end
-
----------------------------------------------------------------------------
--- dummy discovery
----------------------------------------------------------------------------
-local function isPlayerCharacter(inst)
-	for _, plr in ipairs(safe(function() return Players:GetPlayers() end) or {}) do
-		if rawget(plr, "Character") == inst then return true end
-	end
-	return false
-end
-
-local function scanDummies()
-	local list = {}
-	local desc = safe(function() return workspace:GetDescendants() end) or {}
-	local seen = {}
-	for _, d in ipairs(desc) do
-		local cn = d.ClassName
-		local isModel = (cn == "Model")
-		local isPart = (cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" or cn == "BasePart")
-		if (isModel or isPart) and hit(d.Name, CONFIG.train.nameFilter) and not isPlayerCharacter(d) then
-			if not seen[d] then
-				seen[d] = true
-				local pos = getPos(d)
-				if pos then
-					list[#list + 1] = { inst = d, name = tostring(d.Name), pos = pos }
-				end
-			end
-		end
-	end
-
-	-- fallback: any non-player humanoid model close by (dummies without a keyword name)
-	if #list == 0 then
-		for _, d in ipairs(desc) do
-			if d.ClassName == "Model" and not isPlayerCharacter(d) then
-				local hum = safe(function() return d:FindFirstChildOfClass("Humanoid") end)
-				local pos = getPos(d)
-				if hum and pos and dist(pos, myPos()) < CONFIG.train.clickRange then
-					list[#list + 1] = { inst = d, name = tostring(d.Name), pos = pos, fallback = true }
-				end
-			end
-		end
-	end
-	STATE.dummies = list
-	return list
-end
-
-local function nearestDummy()
-	local mine = myPos()
-	local best, bestD = nil, math.huge
-	for _, d in ipairs(STATE.dummies) do
-		local dd = dist(mine, d.pos)
-		if dd < bestD then best, bestD = d, dd end
-	end
-	if best and bestD <= CONFIG.train.clickRange then return best, bestD end
-	return nil, bestD
-end
-
-local function refreshDummy(force)
-	local t = os.clock()
-	if force or t - STATE.timers.dummy > 2 or #STATE.dummies == 0 then
-		STATE.timers.dummy = t
-		scanDummies()
-	end
-	local d, dd = nearestDummy()
-	STATE.dummy = d
-	STATE.dummyDist = dd
-	return d
-end
-
----------------------------------------------------------------------------
--- input — VirtualUser first, executor mouse fallbacks second
----------------------------------------------------------------------------
-local function clickAt(x, y)
-	x, y = math.floor(tonumber(x) or 0), math.floor(tonumber(y) or 0)
-	if VIM then
-		local ok = pcall(function() VIM:SendMouseButtonEvent(x, y, 0, true, game, 1) end)
-		pcall(function() VIM:SendMouseButtonEvent(x, y, 0, false, game, 1) end)
-		if ok then return true end
-	end
-	if type(mouse1click) == "function" then
-		if pcall(mouse1click) then return true end
-	end
-	if type(mouse1press) == "function" and type(mouse1release) == "function" then
-		pcall(mouse1press); pcall(mouse1release)
-		return true
-	end
-	return false
-end
-
-local function screenPos(worldPos)
-	local cam = rawget(workspace, "CurrentCamera")
-	if not cam or not worldPos then return nil end
-	local ok, sp, onScreen = pcall(function() return cam:WorldToViewportPoint(worldPos) end)
-	if not ok or not sp then return nil end
-	if sp.Z ~= nil and sp.Z <= 0 then return nil end
-	return sp.X, sp.Y, onScreen
-end
-
-local function faceCamera(worldPos)
-	local cam = rawget(workspace, "CurrentCamera")
-	if not cam or not worldPos then return false end
-	local ok = pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, worldPos) end)
-	return ok
-end
-
-local function warpTo(worldPos, distance)
-	local root = rootPart()
-	if not root or not worldPos then return false end
-	local back = distance or CONFIG.train.warpRange
-	local target = CFrame.new(worldPos.X, worldPos.Y + 3, worldPos.Z + back)
-	local ok = pcall(function() root.CFrame = target end)
-	if ok then
-		STATE.counters.warps = STATE.counters.warps + 1
-		return true
-	end
-	return false
-end
-
-local function activateTool()
-	local char = LP and rawget(LP, "Character")
-	if not char then return false end
-	local tool = safe(function() return char:FindFirstChildOfClass("Tool") end)
-	if not tool then return false end
-	if safe(function() return tool:Activate() end) ~= nil then return true end
-	pcall(function() tool:Activate() end)
-	return true
-end
-
----------------------------------------------------------------------------
--- prompts (rebirth / upgrade pads usually show up as ProximityPrompt)
----------------------------------------------------------------------------
-local function scanPrompts()
-	local list = {}
-	local desc = safe(function() return workspace:GetDescendants() end) or {}
-	for _, d in ipairs(desc) do
-		if d.ClassName == "ProximityPrompt" then
-			list[#list + 1] = {
-				inst = d,
-				name = tostring(d.Name),
-				action = tostring(rawget(d, "ActionText") or ""),
-				object = tostring(rawget(d, "ObjectText") or ""),
-				score = (hit(d.Name, KW.rebirth) and 3 or 0) + (hit(rawget(d, "ActionText") or "", KW.rebirth) and 2 or 0),
-			}
-		end
-	end
-	table.sort(list, function(a, b)
-		if a.score ~= b.score then return a.score > b.score end
-		return a.name < b.name
-	end)
-	STATE.prompts = list
-	return list
-end
-
-local function firePrompt(entry)
-	local p = entry and entry.inst
-	if not p then return false end
-	local hold = tonumber(rawget(p, "HoldDuration")) or 0
-	pcall(function() p:InputHoldBegin() end)
-	local function release()
-		pcall(function() p:InputHoldEnd() end)
-		pcall(function() p:InputHoldEnd() end)
-	end
-	if hold > 0.05 then
-		task.delay(hold + 0.08, release)
-	else
-		release()
-	end
-	return true
-end
-
----------------------------------------------------------------------------
--- remotes — scan, classify, then prove by stat delta
----------------------------------------------------------------------------
-local function classify(name)
-	if hit(name, KW.rebirth) then return "rebirth", 5 end
-	if hit(name, KW.claim) then return "claim", 4 end
-	if hit(name, KW.buy) then return "buy", 3 end
-	if hit(name, KW.train) then return "train", 2 end
-	return "unknown", 0
-end
-
-local function scanRemotes()
-	local found = {}
-	local seen = {}
-	local function walk(root)
-		if not root then return end
-		local list = safe(function() return root:GetDescendants() end) or {}
-		for _, d in ipairs(list) do
-			local cn = d.ClassName
-			if (cn == "RemoteEvent" or cn == "UnreliableRemoteEvent" or cn == "RemoteFunction") and not seen[d] then
-				seen[d] = true
-				local path = tostring(safe(function() return d:GetFullName() end) or d.Name)
-				local kind, score = classify(d.Name .. " " .. path)
-				found[#found + 1] = {
-					inst = d, name = tostring(d.Name), path = path,
-					kind = cn, group = kind, score = score,
-					result = nil, delta = 0,
-				}
-			end
-		end
-	end
-	walk(RS)
-	walk(workspace)
-	table.sort(found, function(a, b)
-		if a.score ~= b.score then return a.score > b.score end
-		return a.path < b.path
-	end)
-	STATE.remotes = found
-	log("scanned %d remotes, %d prompts, %d dummies", #found, #scanPrompts(), #STATE.dummies)
-
-	-- name-based binding: the best keyword match per class, before any proving
-	for _, e in ipairs(found) do
-		if e.group ~= "unknown" and STATE.bind[e.group] == nil then
-			STATE.bind[e.group] = e
-		end
-	end
-	return found
-end
-
-local function argSets(entry)
-	local sets = { {} }
-	local d = STATE.dummy and STATE.dummy.inst or nil
-	if d then
-		sets[#sets + 1] = { d }
-		sets[#sets + 1] = { d.Name }
-	end
-	if LP then sets[#sets + 1] = { LP } end
-	if d then sets[#sets + 1] = { d, 1 } end
-	return sets
-end
-
--- Fire one candidate across argument shapes, measure which shape moves a stat.
-local function probe(entry, onDone)
-	if not entry or not entry.inst then return end
-	local inst = entry.inst
-	local sets = argSets(entry)
-	local before = collectStats()
-	local beforeTotal = statTotal(before)
-	local i = 0
-	local best = { delta = 0, label = "no change", args = nil }
-
-	local function record(delta, label, args)
-		if math.abs(delta) > math.abs(best.delta) then
-			best = { delta = delta, label = label, args = args }
-		end
-	end
-
-	local function finish()
-		entry.delta = best.delta
-		entry.args = best.args
-		entry.result = best.label
-		if best.delta ~= 0 then
-			entry.score = entry.score + 10
-			if STATE.bind[entry.group] == nil and entry.group ~= "unknown" then
-				STATE.bind[entry.group] = entry
-			end
-		end
-		if onDone then onDone(entry, best) end
-	end
-
-	local function step()
-		i = i + 1
-		local args = sets[i]
-		if not args then finish() return end
-		pcall(function()
-			if entry.kind == "RemoteFunction" then
-				inst:InvokeServer(unpack_(args))
-			else
-				inst:FireServer(unpack_(args))
-			end
-		end)
-		task.wait(0.22)
-		local after = collectStats()
-		local delta = statTotal(after) - beforeTotal
-		if delta ~= 0 then
-			local lines = statDiff(before, after)
-			record(delta, table.concat(lines, " ") .. "  [" .. tostring(#args) .. " arg]", args)
-			before = after
-			beforeTotal = statTotal(after)
-		end
-		step()
-	end
-	step()
-end
-
-local function bindByName()
-	for _, e in ipairs(STATE.remotes) do
-		if e.group ~= "unknown" then
-			local cur = STATE.bind[e.group]
-			if cur == nil or (e.score or 0) > (cur.score or 0) then
-				STATE.bind[e.group] = e
-			end
-		end
-	end
-end
-
-local function dumpText()
-	local out = {}
-	out[#out + 1] = "place 133081981709881  player " .. tostring(LP and LP.Name)
-	out[#out + 1] = string.format("remotes=%d prompts=%d dummies=%d", #STATE.remotes, #STATE.prompts, #STATE.dummies)
-	out[#out + 1] = "--- remotes ---"
-	for i, e in ipairs(STATE.remotes) do
-		if i > 80 then break end
-		out[#out + 1] = string.format("[%s] %s  (%s) %s%s", e.group, e.path, e.kind,
-			e.result and ("=> " .. e.result) or "", e.args and "" or "")
-	end
-	out[#out + 1] = "--- prompts ---"
-	for _, p in ipairs(STATE.prompts) do
-		out[#out + 1] = string.format("%s  action=%q object=%q", p.name, p.action, p.object)
-	end
-	out[#out + 1] = "--- stats ---"
-	local keys = {}
-	for k in pairs(STATE.stats) do keys[#keys + 1] = k end
-	table.sort(keys)
-	for _, k in ipairs(keys) do out[#out + 1] = string.format("%s = %s", k, tostring(STATE.stats[k])) end
-	return table.concat(out, "\n")
-end
-
----------------------------------------------------------------------------
--- the punch
----------------------------------------------------------------------------
-local function punchOnce()
-	local d = refreshDummy(false)
-	local clicked = false
-	if d then
-		if CONFIG.train.warp and (STATE.dummyDist or 0) > CONFIG.train.warpRange then
-			warpTo(d.pos)
-		end
-		if CONFIG.train.face then faceCamera(d.pos) end
-		local x, y = screenPos(d.pos)
-		if x and y then clicked = clickAt(x, y) end
-	end
-	if CONFIG.train.useTool then activateTool() end
-	if not clicked then
-		local e = STATE.bind.train
-		if e and e.inst then
-			pcall(function() e.inst:FireServer() end)
-			clicked = true
-		end
-	end
-	if clicked then STATE.counters.clicks = STATE.counters.clicks + 1 end
-	return clicked, d
-end
-
-local function castRebirth()
-	local fired = false
-	local e = STATE.bind.rebirth
-	if e and e.inst then
-		pcall(function()
-			if e.kind == "RemoteFunction" then e.inst:InvokeServer() else e.inst:FireServer() end
-		end)
-		fired = true
-	end
-	for _, p in ipairs(STATE.prompts) do
-		if (p.score or 0) > 0 then
-			firePrompt(p)
-			fired = true
-			break
-		end
-	end
-	if fired then STATE.counters.rebirths = STATE.counters.rebirths + 1 end
-	return fired
-end
-
-local function castClaim()
-	local fired = false
-	for _, e in ipairs(STATE.remotes) do
-		if e.group == "claim" and e.inst then
-			pcall(function()
-				if e.kind == "RemoteFunction" then e.inst:InvokeServer() else e.inst:FireServer() end
-			end)
-			fired = true
-		end
-	end
-	if fired then STATE.counters.claims = STATE.counters.claims + 1 end
-	return fired
-end
-
----------------------------------------------------------------------------
--- heartbeat tick — one connection drives everything, no thread storms
----------------------------------------------------------------------------
-local function tick(dt)
-	if not STATE.running then return end
-	dt = tonumber(dt) or (1 / 60)
-
-	STATE.timers.stats = STATE.timers.stats + dt
-	if STATE.timers.stats >= 0.5 then
-		STATE.timers.stats = 0
-		STATE.stats = collectStats()
-	end
-
-	if CONFIG.train.enabled then
-		STATE.acc = STATE.acc + dt * math.max(1, math.min(40, CONFIG.train.cps))
-		local guard = 0
-		while STATE.acc >= 1 - 1e-6 and guard < 8 do
-			STATE.acc = math.max(0, STATE.acc - 1)
-			guard = guard + 1
-			local ok = pcall(punchOnce)
-			if not ok then break end
-		end
-	else
-		STATE.acc = 0
-	end
-
-	if CONFIG.economy.rebirth then
-		STATE.timers.rebirth = STATE.timers.rebirth + dt
-		if STATE.timers.rebirth >= CONFIG.economy.rebirthEvery then
-			STATE.timers.rebirth = 0
-			local f = furyStat()
-			if f == nil then f = statTotal(STATE.stats) end
-			if f and f >= CONFIG.economy.rebirthMin then pcall(castRebirth) end
-		end
-	end
-
-	if CONFIG.economy.claim then
-		STATE.timers.claim = STATE.timers.claim + dt
-		if STATE.timers.claim >= CONFIG.economy.claimEvery then
-			STATE.timers.claim = 0
-			pcall(castClaim)
-		end
-	end
-
-	if CONFIG.system.antiafk then
-		STATE.timers.afk = STATE.timers.afk + dt
-		if STATE.timers.afk >= CONFIG.system.afkEvery then
-			STATE.timers.afk = 0
-			if VIM then pcall(function() VIM:SendMouseMoveEvent(0, 0, 0) end) end
-			local hum = humanoid()
-			if hum then pcall(function() hum.Jump = true end) end
-		end
-	end
-end
-
----------------------------------------------------------------------------
--- GLX panel — collapsible, draggable, scrollable body
----------------------------------------------------------------------------
-local T = {
-	bg      = Color3.fromRGB(10, 13, 18),
-	head    = Color3.fromRGB(16, 21, 28),
-	row     = Color3.fromRGB(19, 25, 33),
-	accent  = Color3.fromRGB(95, 255, 205),
-	off     = Color3.fromRGB(46, 56, 68),
-	text    = Color3.fromRGB(214, 224, 232),
-	dim     = Color3.fromRGB(122, 138, 152),
-	bad     = Color3.fromRGB(255, 95, 115),
-}
-
-local PANEL_W, HEAD_H, BODY_H = 252, 34, 430
-local PAD, ROW_H, SEC_H = 11, 30, 24
-
-local gui
-local panel
-local body
-local cursor = 6
-local refresh_ui = function() end
-local buildList
-local setStatus
-local TXL = (Enum.TextXAlignment and Enum.TextXAlignment.Left) or nil
-
-local function mk(class, props, parent)
-	local inst = Instance.new(class)
-	for k, v in pairs(props or {}) do
-		if k ~= "Parent" then
-			local ok = pcall(function() inst[k] = v end)
-			if not ok then log("could not set %s.%s", class, k) end
-		end
-	end
-	if parent then inst.Parent = parent end
-	return inst
-end
-
-local function corner(inst, r)
-	mk("UICorner", { CornerRadius = UDim.new(0, r or 6) }, inst)
-end
-
-local function stroke(inst, color, alpha)
-	mk("UIStroke", { Color = color, Transparency = alpha or 0.6, Thickness = 1 }, inst)
-end
-
-local function buildPanel()
-	local parent = safe(function() return gethui and gethui() end) or CoreGuiSvc
-	gui = mk("ScreenGui", { Name = "GLX_MT", ResetOnSpawn = false, IgnoreGuiInset = true }, parent)
-
-	panel = mk("Frame", {
-		Name = "Panel",
-		Size = UDim2.fromOffset(PANEL_W, HEAD_H + BODY_H),
-		Position = UDim2.new(0, 14, 0.5, -(HEAD_H + BODY_H) / 2),
-		BackgroundColor3 = T.bg,
-		BorderSizePixel = 0,
-		ClipsDescendants = true,
-		Active = true,
-	}, gui)
-	corner(panel, 10)
-	stroke(panel, T.accent, 0.66)
-
-	mk("Frame", {
-		Size = UDim2.new(1, 0, 0, 2),
-		BackgroundColor3 = T.accent,
-		BorderSizePixel = 0,
-	}, panel)
-
-	local header = mk("Frame", {
-		Name = "Header",
-		Size = UDim2.new(1, 0, 0, HEAD_H),
-		BackgroundColor3 = T.head,
-		BorderSizePixel = 0,
-		Active = true,
-	}, panel)
-
-	mk("TextLabel", {
-		Size = UDim2.new(0, 46, 0, HEAD_H),
-		Position = UDim2.fromOffset(PAD, 0),
-		BackgroundTransparency = 1,
-		Text = "GLX",
-		TextColor3 = T.accent,
-		TextSize = 15,
-		Font = Enum.Font and Enum.Font.GothamBold or nil,
-		TextXAlignment = TXL,
-	}, header)
-
-	local sub = mk("TextLabel", {
-		Size = UDim2.new(1, -70, 0, HEAD_H),
-		Position = UDim2.fromOffset(52, 0),
-		BackgroundTransparency = 1,
-		Text = "MUAY THAI EVO",
-		TextColor3 = T.dim,
-		TextSize = 11,
-		Font = Enum.Font and Enum.Font.GothamMedium or nil,
-		TextXAlignment = TXL,
-	}, header)
-
-	local dotAim = mk("Frame", {
-		Size = UDim2.fromOffset(6, 6),
-		Position = UDim2.new(1, -56, 0, 15),
-		BackgroundColor3 = T.off,
-		BorderSizePixel = 0,
-	}, header)
-	corner(dotAim, 3)
-	local dotEsp = mk("Frame", {
-		Size = UDim2.fromOffset(6, 6),
-		Position = UDim2.new(1, -44, 0, 15),
-		BackgroundColor3 = T.off,
-		BorderSizePixel = 0,
-	}, header)
-	corner(dotEsp, 3)
-
-	local fold = mk("TextButton", {
-		Size = UDim2.fromOffset(24, HEAD_H),
-		Position = UDim2.new(1, -28, 0, 0),
-		BackgroundTransparency = 1,
-		Text = "▾",
-		TextColor3 = T.dim,
-		TextSize = 14,
-	}, header)
-
-	body = mk("ScrollingFrame", {
-		Name = "Body",
-		Size = UDim2.new(1, 0, 0, BODY_H),
-		Position = UDim2.fromOffset(0, HEAD_H),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ScrollBarThickness = 2,
-		ScrollBarImageColor3 = T.off,
-		CanvasSize = UDim2.new(0, 0, 0, 400),
-	}, panel)
-
-	-- theme dots reflect live state
-	local function dotColor(on) return on and T.accent or T.off end
-
-	local function section(title)
-		local y = cursor
-		cursor = cursor + SEC_H
-		mk("TextLabel", {
-			Size = UDim2.new(1, -(PAD * 2), 0, 14),
-			Position = UDim2.fromOffset(PAD, y + 8),
-			BackgroundTransparency = 1,
-			Text = title,
-			TextColor3 = T.accent,
-			TextSize = 10,
-			Font = Enum.Font and Enum.Font.GothamBold or nil,
-			TextXAlignment = TXL,
-		}, body)
-	end
-
-	local function rowShell(h)
-		local y = cursor
-		cursor = cursor + h + 4
-		local row = mk("Frame", {
-			Size = UDim2.new(1, -(PAD * 2), 0, h),
-			Position = UDim2.fromOffset(PAD, y),
-			BackgroundColor3 = T.row,
-			BorderSizePixel = 0,
-		}, body)
-		corner(row, 6)
-		return row
-	end
-
-	local function toggleRow(label, get, set)
-		local row = rowShell(ROW_H)
-		mk("TextLabel", {
-			Size = UDim2.new(1, -70, 1, 0),
-			Position = UDim2.fromOffset(9, 0),
-			BackgroundTransparency = 1,
-			Text = label,
-			TextColor3 = T.text,
-			TextSize = 12,
-			TextXAlignment = TXL,
-		}, row)
-		local pill = mk("TextButton", {
-			Size = UDim2.fromOffset(46, 18),
-			Position = UDim2.new(1, -54, 0.5, -9),
-			BackgroundColor3 = T.off,
-			BorderSizePixel = 0,
-			Text = "OFF",
-			TextColor3 = T.dim,
-			TextSize = 10,
-			Font = Enum.Font and Enum.Font.GothamBold or nil,
-		}, row)
-		corner(pill, 9)
-		local function paint()
-			local on = get()
-			pill.BackgroundColor3 = on and T.accent or T.off
-			pill.Text = on and "ON" or "OFF"
-			pill.TextColor3 = on and T.bg or T.dim
-		end
-		pill.MouseButton1Click:Connect(function()
-			set(not get())
-			paint()
-			refresh_ui()
-		end)
-		paint()
-		return paint
-	end
-
-	local function stepperRow(label, get, onDec, onInc)
-		local row = rowShell(ROW_H)
-		mk("TextLabel", {
-			Size = UDim2.new(1, -110, 1, 0),
-			Position = UDim2.fromOffset(9, 0),
-			BackgroundTransparency = 1,
-			Text = label,
-			TextColor3 = T.text,
-			TextSize = 12,
-			TextXAlignment = TXL,
-		}, row)
-		local value = mk("TextLabel", {
-			Size = UDim2.fromOffset(46, 18),
-			Position = UDim2.new(1, -98, 0.5, -9),
-			BackgroundTransparency = 1,
-			Text = tostring(get()),
-			TextColor3 = T.accent,
-			TextSize = 12,
-			Font = Enum.Font and Enum.Font.GothamBold or nil,
-		}, row)
-		local function btn(x, txt, fn)
-			local b = mk("TextButton", {
-				Size = UDim2.fromOffset(22, 18),
-				Position = UDim2.new(1, x, 0.5, -9),
-				BackgroundColor3 = T.off,
-				BorderSizePixel = 0,
-				Text = txt,
-				TextColor3 = T.text,
-				TextSize = 13,
-			}, row)
-			corner(b, 5)
-			b.MouseButton1Click:Connect(function()
-				fn()
-				value.Text = tostring(get())
-				refresh_ui()
-			end)
-		end
-		btn(-46, "−", onDec)
-		btn(-22, "+", onInc)
-		return function() value.Text = tostring(get()) end
-	end
-
-	local function buttonRow(label, onClick, tint)
-		local row = mk("TextButton", {
-			Size = UDim2.new(1, -(PAD * 2), 0, 26),
-			Position = UDim2.fromOffset(PAD, cursor),
-			BackgroundColor3 = T.row,
-			BorderSizePixel = 0,
-			Text = label,
-			TextColor3 = tint or T.text,
-			TextSize = 11,
-			Font = Enum.Font and Enum.Font.GothamBold or nil,
-		}, body)
-		cursor = cursor + 30
-		corner(row, 6)
-		row.MouseButton1Click:Connect(function()
-			local ok, err = pcall(onClick)
-			if not ok then log("action failed: %s", tostring(err)) end
-			refresh_ui()
-		end)
-		return row
-	end
-
-	-- TRAIN
-	section("TRAIN")
-	toggleRow("Auto punch", function() return CONFIG.train.enabled end, function(v) CONFIG.train.enabled = v end)
-	stepperRow("Clicks / sec", function() return CONFIG.train.cps end,
-		function() CONFIG.train.cps = math.max(1, CONFIG.train.cps - 1) end,
-		function() CONFIG.train.cps = math.min(40, CONFIG.train.cps + 1) end)
-	toggleRow("Face dummy", function() return CONFIG.train.face end, function(v) CONFIG.train.face = v end)
-	toggleRow("Warp to dummy", function() return CONFIG.train.warp end, function(v) CONFIG.train.warp = v end)
-
-	-- ECONOMY
-	section("ECONOMY")
-	toggleRow("Auto rebirth", function() return CONFIG.economy.rebirth end, function(v) CONFIG.economy.rebirth = v end)
-	stepperRow("Rebirth at", function() return CONFIG.economy.rebirthMin end,
-		function() CONFIG.economy.rebirthMin = math.max(0, CONFIG.economy.rebirthMin - 500) end,
-		function() CONFIG.economy.rebirthMin = CONFIG.economy.rebirthMin + 500 end)
-	toggleRow("Auto claim", function() return CONFIG.economy.claim end, function(v) CONFIG.economy.claim = v end)
-	buttonRow("Rebirth now", function() castRebirth() end, T.accent)
-
-	-- SCOUT
-	section("SCOUT")
-	buttonRow("Scan remotes + prompts", function()
-		scanRemotes()
-		buildList()
-	end, T.accent)
-
-	local listHolder = mk("Frame", {
-		Size = UDim2.new(1, -(PAD * 2), 0, 112),
-		Position = UDim2.fromOffset(PAD, cursor),
-		BackgroundColor3 = T.bg,
-		BorderSizePixel = 0,
-	}, body)
-	cursor = cursor + 116
-	corner(listHolder, 6)
-	stroke(listHolder, T.off, 0.4)
-
-	local list = mk("ScrollingFrame", {
-		Size = UDim2.new(1, -4, 1, -4),
-		Position = UDim2.fromOffset(2, 2),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ScrollBarThickness = 2,
-		CanvasSize = UDim2.new(0, 0, 0, 100),
-	}, listHolder)
-
-	function buildList()
-		for _, c in ipairs(list:GetChildren()) do
-			if c.ClassName ~= "UIListLayout" and c.ClassName ~= "UIPadding" then pcall(function() c:Destroy() end) end
-		end
-		local y = 0
-		local shown = 0
-		for _, e in ipairs(STATE.remotes) do
-			if shown >= 22 then break end
-			shown = shown + 1
-			local label = string.format("%s%s", e.name, e.result and ("  " .. e.result) or "")
-			if #label > 46 then label = string.sub(label, 1, 46) .. "…" end
-			local b = mk("TextButton", {
-				Size = UDim2.new(1, -2, 0, 18),
-				Position = UDim2.fromOffset(1, y),
-				BackgroundColor3 = T.row,
-				BackgroundTransparency = 0.25,
-				BorderSizePixel = 0,
-				Text = label,
-				TextColor3 = e.group == "unknown" and T.dim or T.text,
-				TextSize = 10,
-				TextXAlignment = TXL,
-			}, list)
-			y = y + 19
-			b.MouseButton1Click:Connect(function()
-				b.TextColor3 = T.accent
-				task.spawn(function()
-					probe(e, function()
-						buildList()
-					end)
-				end)
-			end)
-		end
-		if y == 0 then
-			mk("TextLabel", {
-				Size = UDim2.new(1, 0, 0, 18),
-				BackgroundTransparency = 1,
-				Text = "no remotes yet — press scan",
-				TextColor3 = T.dim,
-				TextSize = 10,
-			}, list)
-			y = 20
-		end
-		list.CanvasSize = UDim2.new(0, 0, 0, y)
-	end
-
-	buttonRow("Probe top 3 (measures Fury)", function()
-		local shown = 0
-		for _, e in ipairs(STATE.remotes) do
-			if shown >= 3 then break end
-			if e.group ~= "unknown" then
-				shown = shown + 1
-				probe(e)
-			end
-		end
-		buildList()
-	end)
-
-	buttonRow("Copy scan to clipboard", function()
-		local txt = dumpText()
-		if type(setclipboard) == "function" then
-			pcall(setclipboard, txt)
-			log("scan copied (%d bytes)", #txt)
-		else
-			log("%s", txt)
-		end
-	end)
-
-	-- SYSTEM
-	section("SYSTEM")
-	toggleRow("Anti-AFK", function() return CONFIG.system.antiafk end, function(v) CONFIG.system.antiafk = v end)
-	setStatus = function(text, color)
-		local lbl = body:FindFirstChild("Status")
-		if not lbl then
-			lbl = mk("TextLabel", {
-				Name = "Status",
-				Size = UDim2.new(1, -(PAD * 2), 0, 16),
-				Position = UDim2.fromOffset(PAD, cursor),
-				BackgroundTransparency = 1,
-				Text = "",
-				TextColor3 = T.dim,
-				TextSize = 10,
-				TextXAlignment = TXL,
-			}, body)
-			cursor = cursor + 20
-		end
-		lbl.Text = text or ""
-		lbl.TextColor3 = color or T.dim
-	end
-	setStatus("booting…")
-
-	local collapsed = false
-	local function setCollapsed(v)
-		local full = HEAD_H + BODY_H
-		collapsed = v and true or false
-		body.Visible = not collapsed
-		local target = UDim2.fromOffset(PANEL_W, v and HEAD_H or full)
-		if TweenService then
-			local ok = pcall(function()
-				TweenService:Create(panel, TweenInfo.new(0.16), { Size = target }):Play()
-			end)
-			if not ok then panel.Size = target end
-		else
-			panel.Size = target
-		end
-		fold.Text = collapsed and "▸" or "▾"
-	end
-	setCollapsed(false)
-	fold.MouseButton1Click:Connect(function()
-		setCollapsed(not collapsed)
-	end)
-
-	-- drag
-	local dragging, dragFrom, panelFrom = false, nil, nil
-	header.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragFrom = UIS:GetMouseLocation()
-			panelFrom = panel.AbsolutePosition or Vector2.new(0, 0)
-		end
-	end)
-	UIS.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end)
-	UIS.InputChanged:Connect(function(input)
-		if not dragging then return end
-		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		local now_pos = UIS:GetMouseLocation()
-		local cam = rawget(workspace, "CurrentCamera")
-		local vp = (cam and rawget(cam, "ViewportSize")) or Vector2.new(1080, 1920)
-		local nx = math.clamp(panelFrom.X + (now_pos.X - dragFrom.X), 0, math.max(0, vp.X - PANEL_W))
-		local ny = math.clamp(panelFrom.Y + (now_pos.Y - dragFrom.Y), 0, math.max(0, vp.Y - HEAD_H))
-		panel.Position = UDim2.fromOffset(nx, ny)
-	end)
-
-	body.CanvasSize = UDim2.new(0, 0, 0, cursor + 12)
-
-	refresh_ui = function()
-		local d = STATE.dummy
-		local f = furyStat()
-		setStatus(string.format("%s | fury %s | clicks %d | rb %d",
-			d and tostring(d.name) or "no dummy",
-			f and tostring(math.floor(f)) or "—",
-			STATE.counters.clicks, STATE.counters.rebirths), d and T.dim or T.bad)
-		dotAim.BackgroundColor3 = dotColor(CONFIG.train.enabled)
-		dotEsp.BackgroundColor3 = dotColor(CONFIG.economy.rebirth)
-	end
-	refresh_ui()
-	buildList()
-	return panel
-end
-
----------------------------------------------------------------------------
--- bootstrap
----------------------------------------------------------------------------
-local okPanel, panelErr = pcall(buildPanel)
-if not okPanel then log("panel build failed: %s", tostring(panelErr)) end
-
-local connections = {}
-local function track(conn)
-	if conn then connections[#connections + 1] = conn end
-	return conn
-end
-
-track(RunService.Heartbeat:Connect(function(dt)
-	local ok, err = pcall(tick, dt)
-	if not ok then log("tick error: %s", tostring(err)) end
-end))
-
-if LP then
-	pcall(function()
-		local idled = rawget(LP, "Idled")
-		if idled then
-			track(idled:Connect(function()
-				if not CONFIG.system.antiafk then return end
-				if VIM then
-					pcall(function()
-						VIM:CaptureController()
-						VIM:ClickButton2(Vector2.new(0, 0))
-					end)
-				end
-			end))
-		end
-	end)
-end
-
-scanDummies()
-scanPrompts()
-scanRemotes()
-bindByName()
-if refresh_ui then pcall(refresh_ui) end
-if buildList then pcall(buildList) end
-
----------------------------------------------------------------------------
--- unload / export
----------------------------------------------------------------------------
-local function unload()
-	STATE.running = false
-	CONFIG.train.enabled = false
-	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
-	connections = {}
-	if gui then pcall(function() gui:Destroy() end) end
-	local g = (type(getgenv) == "function" and getgenv()) or _G
-	if g.GLX_MT then g.GLX_MT = nil end
-	if g.GLX_MT_UNLOAD then g.GLX_MT_UNLOAD = nil end
-	log("unloaded")
-end
-
-local API = {
-	config  = CONFIG,
-	state   = STATE,
-	bind    = STATE.bind,
-	scan    = scanRemotes,
-	dummies = scanDummies,
-	prompts = scanPrompts,
-	probe   = probe,
-	punch   = punchOnce,
-	rebirth = castRebirth,
-	claim   = castClaim,
-	tick    = tick,
-	dump    = dumpText,
-	refresh = refresh_ui,
-	unload  = unload,
-}
-genv.GLX_MT = API
-genv.GLX_MT_UNLOAD = unload
-
-log("ready — place 133081981709881 | %d remotes | %d dummies | bind: train=%s rebirth=%s",
-	#STATE.remotes, #STATE.dummies,
-	STATE.bind.train and STATE.bind.train.name or "—",
-	STATE.bind.rebirth and STATE.bind.rebirth.name or "—")
-log("panel: GLX_MT (left) | toggle auto punch, set CPS, press scan")
+print("[SAIM] loaded | team="..tostring(getTeamName(LP)).." vp="..tostring(Camera.ViewportSize).." fov="..tostring(CFG.FOV).." smooth="..tostring(CFG.Smooth))
+return _G.SAIM
