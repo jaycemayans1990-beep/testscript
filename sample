@@ -97,7 +97,7 @@ local State = {
         Aimbot = true, TeamCheck = true, WallCheck = false, Prediction = true,
         PredReactivity = 1.5, PredMaxSlew = 3.0, TrackBoost = 1.5, LagComp = true,
         DragSwitch = true, FlickSpeed = 90, FreeSteer = true, SwitchAssist = true,
-        WeaponCheck = false, TargetPartMode = "Head", PingCompensation = true,
+        WeaponCheck = true, TargetPartMode = "Head", PingCompensation = true,
         DropIsMultiplier = true, AutoBulletSpeed = true, BulletSpeed = 5000,
         BulletGravity = workspace.Gravity, Smoothness = 0.8, FOV = 100,
         ShowFOV = false, ESP = true, ESPName = true, Teleport = false
