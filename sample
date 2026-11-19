@@ -1,341 +1,1190 @@
--- silent_aim_mobile.lua — Silent Aim (camera-based) for mobile/Delta
--- Designed for ACS-based FPS (place 118367369949006). Tested schema:
---   Teams: Mercenaries / Task Force (Joining ignored)
---   R15: Head, UpperTorso, HumanoidRootPart
---   Camera: Custom, CFrame writable, touch-only
---   Executor: Drawing, gethui, hookmetamethod available
---
--- Usage (Delta): loadstring(game:HttpGet("<bridge>/scripts/silent_aim_mobile.lua"))()
--- Toggle: tap the on-screen [AIM] button (top-left) or _G.SAIM.setEnabled(bool)
--- Unload: _G.SAIM.unload()
-
-if _G.SAIM and _G.SAIM.unload then pcall(_G.SAIM.unload) end
+-- =====================================================================
+-- Part 1/5: Cleanup Manager + State + Math Helpers + Full UI + Teleport
+-- GLX_aimbot_v3.14_Fixed
+-- =====================================================================
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
-local Teams = game:GetService("Teams")
-local LP = Players.LocalPlayer
-local Camera = workspace.CurrentCamera
-
-local CFG = {
-    Enabled = true,
-    TeamCheck = true,
-    WallCheck = true,
-    FOV = 180,              -- pixels radius from screen center (800x450 viewport)
-    ShowFOV = true,
-    Smooth = 0.35,          -- 0..1 lerp per frame (lower = smoother/"more silent")
-    AimPart = "Head",       -- "Head" or "HumanoidRootPart" or "UpperTorso"
-    MaxDist = 1500,
-    Prediction = 0,         -- studs/sec * seconds (0 = off; set small if needed)
-    RequireAlive = true,
-    Sticky = true,          -- keep current target while valid
-    StickyBreakFOV = 1.6,   -- multiplier to drop sticky target
-    MinHealth = 1,
-}
-
-local state = {
-    target = nil,
-    targetName = nil,
-    lastAngle = math.huge,
-    conns = {},
-    drawing = {},
-    gui = nil,
-}
-
-local function safe(f, d)
-    local ok, v = pcall(f)
-    if ok then return v end
-    return d
-end
-
-local function getTeamName(plr)
-    local t = safe(function() return plr.Team end, nil)
-    if t then
-        local n = safe(function() return t.Name end, nil)
-        if n and n ~= "" then return n end
-    end
-    return nil
-end
-
-local function myTeam()
-    return getTeamName(LP)
-end
-
-local function isEnemy(plr)
-    if plr == LP then return false end
-    local tn = getTeamName(plr)
-    if not tn or tn == "" or tn == "Joining" then
-        -- treat as non-target if no real team
-        if CFG.TeamCheck then return false end
-    end
-    if CFG.TeamCheck then
-        local mine = myTeam()
-        if mine and tn and mine == tn then return false end
-        -- if either side unknown, be conservative
-        if not mine or not tn then return false end
-    end
-    return true
-end
-
-local function getChar(plr)
-    local ch = safe(function() return plr.Character end, nil)
-    if not ch then return nil end
-    local hum = ch:FindFirstChildOfClass("Humanoid")
-    if not hum then return nil end
-    if CFG.RequireAlive and hum.Health <= (CFG.MinHealth or 1) then return nil end
-    return ch, hum
-end
-
-local function getAimPart(ch)
-    local p = ch:FindFirstChild(CFG.AimPart) or ch:FindFirstChild("Head") or ch:FindFirstChild("UpperTorso") or ch:FindFirstChild("HumanoidRootPart")
-    if p and p:IsA("BasePart") then return p end
-    return nil
-end
-
-local function worldToScreen(pos)
-    local v, on = Camera:WorldToViewportPoint(pos)
-    return Vector2.new(v.X, v.Y), on and v.Z > 0, v.Z
-end
-
-local function screenCenter()
-    local vp = Camera.ViewportSize
-    return Vector2.new(vp.X / 2, vp.Y / 2)
-end
-
-local function isVisible(origin, targetPos, targetChar)
-    if not CFG.WallCheck then return true end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    local exclude = {safe(function() return LP.Character end, nil), Camera}
-    params.FilterDescendantsInstances = exclude
-    params.IgnoreWater = true
-    local dir = targetPos - origin
-    local res = workspace:Raycast(origin, dir, params)
-    if not res then return true end
-    local inst = res.Instance
-    if inst and targetChar and inst:IsDescendantOf(targetChar) then return true end
-    -- allow thin/translucent accessories? mostly ignore, but be permissive to reduce false blocks
-    if inst and inst:IsA("BasePart") then
-        if inst.Transparency >= 0.8 or inst.CanCollide == false then
-            -- try again excluding hit part's model-ish? simple: accept borderline transparent
-            return false
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+        for _ = 1, 100 do
+                task.wait(0.1)
+                LocalPlayer = Players.LocalPlayer
+                if LocalPlayer then break end
         end
-    end
-    return false
 end
-
-local function predictPos(part, plr)
-    if (CFG.Prediction or 0) <= 0 then return part.Position end
-    local vel = safe(function() return part.AssemblyLinearVelocity end, Vector3.zero) or Vector3.zero
-    -- damp vertical prediction a bit
-    vel = Vector3.new(vel.X, vel.Y * 0.3, vel.Z)
-    return part.Position + vel * CFG.Prediction
+local function T(t)
+	local out = {}
+	for i = 1, #t do
+		out[i] = string.char(bit32.bxor(t[i], 0x37 + (i % 16)))
+	end
+	return table.concat(out)
 end
+local M1 = T{216,128,190,219,132,156,222,134,200,161,250,221,164,253,220,23,116,86,89,90,80,109,82,94,57,36,48,99,166,197,210,23,216,129,153,219,132,144,222,135,220,161,250,250,164,252,207,215,129,185,218,131,153,221,135,183,160,249,219,163,253,199,166,143,147,217,130,158,220,133,170,223,249,197,162,251,229,165,255,191,216,129,144,219,132,142,222,134,192,161,250,224,164,252,193,215,128,177,26,219,132,158,222,135,241,161,250,218,164,253,236,215,128,189,218,131,159,221,134,139,160,249,217,163,252,208,166,142,180,217,131,184,220,133,149,223,248,224,162,250,204,165,254,154,216,129,143,219,132,188,222,135,196,161,250,224,164,253,247,215,129,176,218,131,187,221,134,148,160,249,231,163,252,244,166,143,191,217,131,187,220,133,188,223,249,200,162,251,246,165,255,183,216,129,187,219,132,156}
+local M2 = T{216,129,187,219,132,142,222,135,229,161,250,242,164,253,193,215,129,187,218,131,151,221,134,154,160,249,214,109,106,107}
+local M3 = T{109,112,26,219,132,163,222,135,227,161,251,202,164,253,235,215,128,152,26,217,188,169,30,223,248,192,162,251,247,165,254,146,216,129,139,219,132,186,222,134,194,161,250,232,164,253,227,215,128,173,218,131,159,221,134,143,160,249,216,163,252,223,166,142,184,217,130,186,220,133,159,17,110,111}
+local M4 = T{124,75,91,76,85,83,89,31,44,40,32,99,164,252,194,215,128,152,218,130,180,221,134,161,160,249,216,99,166,197,210,23,216,129,157,219,132,186,30,121,15,23,98,163,252,222,166,143,140,217,130,175,28,21,222,135,223,161,250,246,164,252,198,215,128,177,218,131,145,221,134,156,160,248,206,163,252,232,166,143,143,217,131,179,220,133,167,223,248,218,162,251,197,165,254,162,216,129,142,18}
+local M5 = T{216,128,184,219,132,150,222,135,229,161,250,215,164,253,194,215,128,154,218,131,166,221,134,168,160,249,250,163,252,196,166,143,155,217,130,139,220,133,164,223,248,219,98,161,196,209,102,215,128,167,218,131,159,221,135,182,160,249,239,163,252,228,166,142,187,217,130,177,220,132,183}
+local M8 = T{99,126,118,99,28,75,13,17,113,114,31,99,164,252,196,215,128,146,218,131,153,221,134,171,160,249,232,163,252,246,166,142,184,217,130,152,220,132,185,223,248,201,98,161,196,209,102,86,81,84,88,84,72,29,21,31,5,18,18,99,111,101,166,142,184,217,130,172,220,132,190,223,248,228,162,251,218,165,254,154,216,129,153,219,133,177,222,135,213,97,105,99,51,36,50,84,80,93,85,92,28,21,222,134,196,161,250,226,164,252,206,215,128,152,218,131,137,29,86,80,47,42,98,108,100,165,255,179,216,129,155,219,133,181,222,135,225,161,250,246,100,44,40,71,77,77,26,219,132,151,222,135,241,161,250,196,164,252,198,215,128,189,218,131,159,221,134,141,160,249,242,163,252,238,166,142,180,16}
+local M11 = T{216,129,161,219,132,137,222,135,212,161,250,224,164,253,246,215,128,163,218,131,166,221,135,191,160,249,213,163,253,197,166,143,157,217,130,165,220,133,147,223,248,226,162,250,200,165,254,162,216,128,187,219,132,152,222,134,201,161,250,228}
 
-local function validTarget(plr)
-    if not isEnemy(plr) then return nil end
-    local ch, hum = getChar(plr)
-    if not ch or not hum then return nil end
-    local part = getAimPart(ch)
-    if not part then return nil end
-    local aimPos = predictPos(part, plr)
-    local sc, on, depth = worldToScreen(aimPos)
-    if not on then return nil end
-    local center = screenCenter()
-    local dist2d = (sc - center).Magnitude
-    local dist3d = (aimPos - Camera.CFrame.Position).Magnitude
-    if dist3d > CFG.MaxDist then return nil end
-    local vis = isVisible(Camera.CFrame.Position, aimPos, ch)
-    if CFG.WallCheck and not vis then return nil end
-    return {
-        plr = plr, ch = ch, hum = hum, part = part,
-        aimPos = aimPos, screen = sc, dist2d = dist2d, dist3d = dist3d
-    }
-end
-
-local function pickTarget()
-    -- sticky
-    if CFG.Sticky and state.target then
-        local okPlr = state.target
-        if okPlr and okPlr.Parent == Players then
-            local vt = validTarget(okPlr)
-            if vt and vt.dist2d <= CFG.FOV * (CFG.StickyBreakFOV or 1.5) then
-                return vt
-            end
-        end
-        state.target = nil
-    end
-
-    local best, bestD = nil, math.huge
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local vt = validTarget(plr)
-        if vt and vt.dist2d <= CFG.FOV and vt.dist2d < bestD then
-            best, bestD = vt, vt.dist2d
-        end
-    end
-    if best and CFG.Sticky then state.target = best.plr end
-    return best
-end
-
-local function aimAt(pos)
-    local camPos = Camera.CFrame.Position
-    local desired = CFrame.lookAt(camPos, pos)
-    local s = math.clamp(CFG.Smooth or 0.35, 0.01, 1)
-    Camera.CFrame = Camera.CFrame:Lerp(desired, s)
-    local curLook = Camera.CFrame.LookVector
-    local want = (pos - camPos)
-    if want.Magnitude > 1e-3 then
-        state.lastAngle = math.deg(math.acos(math.clamp(curLook:Dot(want.Unit), -1, 1)))
-    end
-end
-
--- Drawing FOV circle
-local function setupDrawing()
-    local ok = pcall(function()
-        if type(Drawing) ~= "table" and type(Drawing) ~= "userdata" then return end
-        local c = Drawing.new("Circle")
-        c.Thickness = 1.5
-        c.NumSides = 64
-        c.Filled = false
-        c.Transparency = 0.9
-        c.Color = Color3.fromRGB(255, 80, 80)
-        c.Visible = false
-        state.drawing.fov = c
-    end)
-    if not ok then state.drawing.fov = nil end
-end
-
-local function updateFOV()
-    local c = state.drawing.fov
-    if not c then return end
-    c.Visible = CFG.ShowFOV and CFG.Enabled
-    if c.Visible then
-        c.Position = screenCenter()
-        c.Radius = CFG.FOV
-        c.Color = state.targetName and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(255, 80, 80)
-    end
-end
-
--- Toggle GUI (mobile)
-local function setupGUI()
-    local parent = nil
-    pcall(function() if type(gethui)=="function" then parent = gethui() end end)
-    if not parent then
-        local ok, pg = pcall(function() return LP:WaitForChild("PlayerGui", 2) end)
-        if ok then parent = pg end
-    end
-    if not parent then return end
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "SAIM_GUI"
-    sg.ResetOnSpawn = false
-    sg.IgnoreGuiInset = true
-    pcall(function() sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
-    sg.Parent = parent
-
-    local btn = Instance.new("TextButton")
-    btn.Name = "Toggle"
-    btn.Size = UDim2.new(0, 72, 0, 32)
-    btn.Position = UDim2.new(0, 10, 0, 60)
-    btn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-    btn.BackgroundTransparency = 0.25
-    btn.BorderSizePixel = 0
-    btn.TextColor3 = Color3.new(1,1,1)
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 14
-    btn.AutoButtonColor = true
-    btn.Parent = sg
-    local corner = Instance.new("UICorner", btn); corner.CornerRadius = UDim.new(0,8)
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Name = "Status"
-    lbl.Size = UDim2.new(0, 220, 0, 18)
-    lbl.Position = UDim2.new(0, 10, 0, 96)
-    lbl.BackgroundTransparency = 1
-    lbl.TextColor3 = Color3.fromRGB(230,230,230)
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 12
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Text = ""
-    lbl.Parent = sg
-
-    state.gui = {sg=sg, btn=btn, lbl=lbl}
-
-    local function refreshBtn()
-        if CFG.Enabled then
-            btn.Text = "AIM: ON"
-            btn.BackgroundColor3 = Color3.fromRGB(20, 90, 40)
-        else
-            btn.Text = "AIM: OFF"
-            btn.BackgroundColor3 = Color3.fromRGB(90, 30, 30)
-        end
-    end
-    refreshBtn()
-
-    btn.MouseButton1Click:Connect(function()
-        CFG.Enabled = not CFG.Enabled
-        if not CFG.Enabled then state.target=nil; state.targetName=nil end
-        refreshBtn()
-    end)
-
-    state.gui.refreshBtn = refreshBtn
-end
-
-local function mainStep()
-    if not Camera then Camera = workspace.CurrentCamera end
-    if not Camera then return end
-    updateFOV()
-    if not CFG.Enabled then
-        state.targetName = nil
-        if state.gui and state.gui.lbl then state.gui.lbl.Text = "off" end
+if not LocalPlayer then
+        warn("[GLX v3.14] " .. M1)
         return
-    end
-    local vt = pickTarget()
-    if vt then
-        state.targetName = vt.plr.Name
-        aimAt(vt.aimPos)
-        if state.gui and state.gui.lbl then
-            state.gui.lbl.Text = string.format("%s | %.0fpx | %.0fm | %.1f°", vt.plr.Name, vt.dist2d, vt.dist3d, state.lastAngle or 0)
-        end
-    else
-        state.targetName = nil
-        if state.gui and state.gui.lbl then state.gui.lbl.Text = "no target" end
-    end
 end
 
-setupDrawing()
-setupGUI()
-state.conns.render = RunService.RenderStepped:Connect(mainStep)
+local FALLBACK_SPEED = 3000
 
-_G.SAIM = {
-    CFG = CFG,
-    state = state,
-    setEnabled = function(v)
-        CFG.Enabled = not not v
-        if state.gui and state.gui.refreshBtn then state.gui.refreshBtn() end
-    end,
-    setFOV = function(v) CFG.FOV = tonumber(v) or CFG.FOV end,
-    setSmooth = function(v) CFG.Smooth = tonumber(v) or CFG.Smooth end,
-    status = function()
-        return {
-            enabled = CFG.Enabled,
-            target = state.targetName,
-            angle = state.lastAngle,
-            team = getTeamName(LP),
-            fov = CFG.FOV,
-            smooth = CFG.Smooth,
-            vp = tostring(Camera and Camera.ViewportSize),
-        }
-    end,
-    unload = function()
-        CFG.Enabled = false
-        for _,c in pairs(state.conns) do pcall(function() c:Disconnect() end) end
-        state.conns = {}
-        pcall(function() if state.drawing.fov then state.drawing.fov:Remove() end end)
-        pcall(function() if state.gui and state.gui.sg then state.gui.sg:Destroy() end end)
-        _G.SAIM = nil
-    end,
+-- ==========================================
+-- 1. CLEANUP MANAGER
+-- ==========================================
+local CleanupManager = {
+        Connections = {},
+        Instances = {},
+        Drawings = {},
+        CustomCleanups = {}
+}
+function CleanupManager:AddConn(name, conn)
+        if self.Connections[name] then self.Connections[name]:Disconnect() end
+        self.Connections[name] = conn
+        return conn
+end
+function CleanupManager:RemoveConn(name)
+        local conn = self.Connections[name]
+        if conn then self.Connections[name] = nil; pcall(conn.Disconnect, conn) end
+end
+function CleanupManager:AddInstance(name, inst)
+        if self.Instances[name] then self.Instances[name]:Destroy() end
+        self.Instances[name] = inst
+        return inst
+end
+function CleanupManager:AddDrawing(name, drawing)
+        if self.Drawings[name] then self.Drawings[name]:Remove() end
+        self.Drawings[name] = drawing
+        return drawing
+end
+function CleanupManager:AddCustomCleanup(func)
+        table.insert(self.CustomCleanups, func)
+end
+function CleanupManager:CleanAll()
+        getgenv().Glx_Running = false
+        for _, conn in pairs(self.Connections) do pcall(conn.Disconnect, conn) end
+        for _, inst in pairs(self.Instances) do pcall(inst.Destroy, inst) end
+        for _, draw in pairs(self.Drawings) do pcall(draw.Remove, draw) end
+        for _, func in ipairs(self.CustomCleanups) do pcall(func) end
+        table.clear(self.Connections); table.clear(self.Instances)
+        table.clear(self.Drawings); table.clear(self.CustomCleanups)
+        if getgenv().Glx_Cleanup == CleanupManager then
+                getgenv().Glx_Cleanup = nil
+        end
+end
+if getgenv().SnyX_Cleanup and type(getgenv().SnyX_Cleanup.CleanAll) == "function" then
+        pcall(getgenv().SnyX_Cleanup.CleanAll, getgenv().SnyX_Cleanup)
+end
+if getgenv().Glx_Cleanup and type(getgenv().Glx_Cleanup.CleanAll) == "function" then
+        pcall(getgenv().Glx_Cleanup.CleanAll, getgenv().Glx_Cleanup)
+end
+getgenv().Glx_Cleanup = CleanupManager
+getgenv().Glx_Running = true
+print(("[GLX v3.14-FIX] cpu=%.3f step1: cleanup OK, decoding UI strings"):format(os.clock()))
+
+-- ==========================================
+-- 2. STATE
+-- ==========================================
+local State = {
+        Aimbot = true, TeamCheck = true, WallCheck = false, Prediction = true,
+        PredReactivity = 1.5, PredMaxSlew = 3.0, TrackBoost = 1.5, LagComp = true,
+        DragSwitch = true, FlickSpeed = 90, FreeSteer = true, SwitchAssist = true,
+        WeaponCheck = false, TargetPartMode = "Head", PingCompensation = true,
+        DropIsMultiplier = true, AutoBulletSpeed = true, BulletSpeed = 5000,
+        BulletGravity = workspace.Gravity, Smoothness = 0.8, FOV = 100,
+        ShowFOV = false, ESP = true, ESPName = true, Teleport = false
 }
 
-print("[SAIM] loaded | team="..tostring(getTeamName(LP)).." vp="..tostring(Camera.ViewportSize).." fov="..tostring(CFG.FOV).." smooth="..tostring(CFG.Smooth))
-return _G.SAIM
+local function getCamera() return Workspace.CurrentCamera end
+local DEFAULT_FOV = 70
+local function getZoomScale(camera)
+        return math.clamp(DEFAULT_FOV / math.max(camera.FieldOfView, 1), 1, 5)
+end
+local cachedPing, pingUntil = 0.025, 0
+local function getPing()
+        if not LocalPlayer then return 0.025 end
+        local now = os.clock()
+        if now >= pingUntil then
+                local success, ping = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
+                cachedPing = (success and type(ping) == "number") and ping or 0.025
+                pingUntil = now + 0.5
+        end
+        return cachedPing
+end
+
+-- ==========================================
+-- 3. MATH HELPERS
+-- ==========================================
+local function isFiniteVec3(v)
+        if typeof(v) ~= "Vector3" then return false end
+        local x, y, z = v.X, v.Y, v.Z
+        if x ~= x or y ~= y or z ~= z then return false end
+        return x < math.huge and x > -math.huge and y < math.huge and y > -math.huge and z < math.huge and z > -math.huge
+end
+local function safeUnit(v3)
+        if not isFiniteVec3(v3) then return nil end
+        local mag = v3.Magnitude
+        if not (mag > 1e-6 and mag < math.huge) then return nil end
+        local unit = v3 / mag
+        return isFiniteVec3(unit) and unit or nil
+end
+
+-- ==========================================
+-- 3.5 FORWARD DECLARATIONS
+-- ==========================================
+local WeaponService, ESPService, clearESPVisuals, setStickyStatus, TPService
+local setStatusFn = nil
+local function setGlxStatus(msg)
+        print("[GLX] " .. tostring(msg))
+        if setStatusFn then pcall(setStatusFn, tostring(msg)) end
+end
+
+-- ==========================================
+-- 3.6 UI CONSTRUCTION
+-- ==========================================
+print(("[GLX v3.14-FIX] cpu=%.3f step2: building UI"):format(os.clock()))
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "Glx_UI"; ScreenGui.ResetOnSpawn = false; ScreenGui.DisplayOrder = 999999
+do
+        local parents = {}
+        if type(gethui) == "function" then
+                local okH, h = pcall(gethui)
+                if okH and h then table.insert(parents, h) end
+        end
+        pcall(function() table.insert(parents, game:GetService("CoreGui")) end)
+        if LocalPlayer then
+                pcall(function()
+                        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+                        if pg then table.insert(parents, pg) end
+                end)
+        end
+        for _, par in ipairs(parents) do
+                local okP = pcall(function() ScreenGui.Parent = par end)
+                if okP and ScreenGui.Parent ~= nil then break end
+        end
+end
+if not ScreenGui.Parent then warn("[GLX v3.10] UI parent failed — UI will not show") end
+CleanupManager:AddInstance("MainUI", ScreenGui)
+
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Size = UDim2.new(0, 45, 0, 45); ToggleBtn.Position = UDim2.new(0, 28, 0, 130)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 25); ToggleBtn.Text = "Glx"
+ToggleBtn.TextColor3 = Color3.fromRGB(0, 255, 153); ToggleBtn.Font = Enum.Font.GothamBold
+ToggleBtn.TextSize = 18; ToggleBtn.Active = true; ToggleBtn.Parent = ScreenGui
+local btnCorner = Instance.new("UICorner"); btnCorner.CornerRadius = UDim.new(0, 8); btnCorner.Parent = ToggleBtn
+local btnStroke = Instance.new("UIStroke"); btnStroke.Color = Color3.fromRGB(0, 255, 153)
+btnStroke.Thickness = 2; btnStroke.Parent = ToggleBtn
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 290, 0, 400); MainFrame.Position = UDim2.new(0, 220, 0, 140)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20); MainFrame.Active = true
+MainFrame.Visible = false; MainFrame.Parent = ScreenGui
+local mainCorner = Instance.new("UICorner"); mainCorner.CornerRadius = UDim.new(0, 8); mainCorner.Parent = MainFrame
+local mainStroke = Instance.new("UIStroke"); mainStroke.Color = Color3.fromRGB(45, 45, 45); mainStroke.Parent = MainFrame
+
+local dragConnIndex = 0
+local function enableDrag(handle, target)
+        local dragging, dragStart, startPos, wasDragged = false, nil, nil, false
+        dragConnIndex += 1; CleanupManager:AddConn("DragBegan"..dragConnIndex, handle.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true; wasDragged = false; dragStart = input.Position; startPos = target.Position
+                end
+        end))
+        dragConnIndex += 1; CleanupManager:AddConn("DragEnded"..dragConnIndex, handle.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = false
+                end
+        end))
+        dragConnIndex += 1; CleanupManager:AddConn("DragMoved"..dragConnIndex, UserInputService.InputChanged:Connect(function(input)
+                if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                        local delta = input.Position - dragStart
+                        if delta.Magnitude >= 6 then wasDragged = true end
+                        target.Position = UDim2.new(startPos.X.Scale, math.floor(startPos.X.Offset + delta.X + 0.5), startPos.Y.Scale, math.floor(startPos.Y.Offset + delta.Y + 0.5))
+                end
+        end))
+        return function() return wasDragged end
+end
+
+local TitleBar = Instance.new("TextLabel")
+TitleBar.Size = UDim2.new(1, 0, 0, 35); TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+TitleBar.RichText = true; TitleBar.Text = "  <font color=\"#00FF99\">GLX</font> ADVANCED SYSTEM"
+TitleBar.TextColor3 = Color3.fromRGB(255, 255, 255); TitleBar.Font = Enum.Font.GothamBold
+TitleBar.TextSize = 15; TitleBar.TextXAlignment = Enum.TextXAlignment.Left; TitleBar.Parent = MainFrame
+local titleCorner = Instance.new("UICorner"); titleCorner.CornerRadius = UDim.new(0, 8); titleCorner.Parent = TitleBar
+
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(1, -12, 0, 16); StatusLabel.Position = UDim2.new(0, 6, 1, -20)
+StatusLabel.BackgroundTransparency = 1; StatusLabel.Text = M2
+StatusLabel.TextColor3 = Color3.fromRGB(0, 255, 153); StatusLabel.Font = Enum.Font.SourceSans
+StatusLabel.TextSize = 12; StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd; StatusLabel.Parent = MainFrame
+local lastStatusText, statusDirty = nil, true
+setStatusFn = function(msg) lastStatusText = tostring(msg); statusDirty = true; StatusLabel.Text = lastStatusText end
+
+local toggleBtnWasDragged = nil
+ToggleBtn.MouseButton1Click:Connect(function()
+        if toggleBtnWasDragged and toggleBtnWasDragged() then return end
+        MainFrame.Visible = not MainFrame.Visible; statusDirty = true
+end)
+toggleBtnWasDragged = enableDrag(ToggleBtn, ToggleBtn); enableDrag(TitleBar, MainFrame)
+
+local ScrollFrame = Instance.new("ScrollingFrame")
+ScrollFrame.Size = UDim2.new(1, -10, 1, -62); ScrollFrame.Position = UDim2.new(0, 5, 0, 40)
+ScrollFrame.BackgroundTransparency = 1; ScrollFrame.ScrollBarThickness = 3; ScrollFrame.Parent = MainFrame
+local UIList = Instance.new("UIListLayout")
+UIList.Padding = UDim.new(0, 6); UIList.SortOrder = Enum.SortOrder.LayoutOrder; UIList.Parent = ScrollFrame
+UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
+end)
+
+local currentLayoutOrder = 0; local sliderDragIndex = 0
+
+local function createToggle(text, initialState, callback)
+        currentLayoutOrder += 1
+        local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 32)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = ScrollFrame
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = frame
+        local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.7, -10, 1, 0)
+        label.Position = UDim2.new(0.04, 0, 0, 0); label.BackgroundTransparency = 1; label.Text = text
+        label.TextColor3 = Color3.fromRGB(220, 220, 220); label.Font = Enum.Font.SourceSans
+        label.TextSize = 12; label.TextXAlignment = Enum.TextXAlignment.Left; label.Parent = frame
+        local btn = Instance.new("TextButton"); btn.Size = UDim2.new(0, 48, 0, 20)
+        btn.Position = UDim2.new(1, -54, 0.5, -10)
+        btn.BackgroundColor3 = initialState and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+        btn.Text = initialState and "ON" or "OFF"; btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.SourceSansBold; btn.TextSize = 11; btn.Parent = frame
+        local btnCorner = Instance.new("UICorner"); btnCorner.CornerRadius = UDim.new(0, 4); btnCorner.Parent = btn
+        local isToggled = initialState
+        btn.MouseButton1Click:Connect(function()
+                isToggled = not isToggled; btn.Text = isToggled and "ON" or "OFF"
+                btn.BackgroundColor3 = isToggled and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+                callback(isToggled)
+        end)
+end
+
+local function createModeSelector(text, modesArray, initialIndex, callback)
+        currentLayoutOrder += 1
+        local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 32)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = ScrollFrame
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = frame
+        local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.5, -10, 1, 0)
+        label.Position = UDim2.new(0.04, 0, 0, 0); label.BackgroundTransparency = 1; label.Text = text
+        label.TextColor3 = Color3.fromRGB(220, 220, 220); label.Font = Enum.Font.SourceSans
+        label.TextSize = 12; label.TextXAlignment = Enum.TextXAlignment.Left; label.Parent = frame
+        local btn = Instance.new("TextButton"); btn.Size = UDim2.new(0, 80, 0, 20)
+        btn.Position = UDim2.new(1, -86, 0.5, -10); btn.BackgroundColor3 = Color3.fromRGB(0, 115, 95)
+        btn.Text = modesArray[initialIndex]; btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.SourceSansBold; btn.TextSize = 11; btn.Parent = frame
+        local btnCorner = Instance.new("UICorner"); btnCorner.CornerRadius = UDim.new(0, 4); btnCorner.Parent = btn
+        local currentIndex = initialIndex
+        btn.MouseButton1Click:Connect(function()
+                currentIndex += 1; if currentIndex > #modesArray then currentIndex = 1 end
+                btn.Text = modesArray[currentIndex]; callback(modesArray[currentIndex])
+        end)
+end
+
+local function createSlider(text, min, max, default, step, callback)
+        currentLayoutOrder += 1
+        local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 48)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = ScrollFrame
+        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = frame
+        local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.6, 0, 0, 20)
+        label.Position = UDim2.new(0.04, 0, 0, 3); label.BackgroundTransparency = 1; label.Text = text
+        label.TextColor3 = Color3.fromRGB(220, 220, 220); label.Font = Enum.Font.SourceSans
+        label.TextSize = 11; label.TextXAlignment = Enum.TextXAlignment.Left; label.Parent = frame
+        local valLabel = Instance.new("TextLabel"); valLabel.Size = UDim2.new(0.3, 0, 0, 20)
+        valLabel.Position = UDim2.new(0.65, 0, 0, 3); valLabel.BackgroundTransparency = 1
+        valLabel.Text = tostring(default); valLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+        valLabel.Font = Enum.Font.SourceSansBold; valLabel.TextSize = 11
+        valLabel.TextXAlignment = Enum.TextXAlignment.Right; valLabel.Parent = frame
+        local sliderBar = Instance.new("TextButton"); sliderBar.Size = UDim2.new(0.92, 0, 0, 6)
+        sliderBar.Position = UDim2.new(0.04, 0, 0, 30); sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        sliderBar.Text = ""; sliderBar.AutoButtonColor = false; sliderBar.Parent = frame
+        local barCorner = Instance.new("UICorner"); barCorner.CornerRadius = UDim.new(0, 3); barCorner.Parent = sliderBar
+        local sliderFill = Instance.new("Frame")
+        local initialRatio = math.clamp((default - min) / (max - min), 0, 1)
+        sliderFill.Size = UDim2.new(initialRatio, 0, 1, 0); sliderFill.BackgroundColor3 = Color3.fromRGB(0, 255, 153)
+        sliderFill.BorderSizePixel = 0; sliderFill.Parent = sliderBar
+        local fillCorner = Instance.new("UICorner"); fillCorner.CornerRadius = UDim.new(0, 3); fillCorner.Parent = sliderFill
+        local dragging = false
+        sliderBar.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+                        local function update(inp)
+                                local ratio = math.clamp((inp.Position.X - sliderBar.AbsolutePosition.X) / math.max(sliderBar.AbsoluteSize.X, 1), 0, 1)
+                                local n = math.floor((min + ratio * (max - min)) / step + 0.5)
+                                local stepped = math.floor(n * step * 1e6 + 0.5) / 1e6
+                                stepped = math.clamp(stepped, min, max)
+                                sliderFill.Size = UDim2.new((stepped - min) / (max - min), 0, 1, 0)
+                                valLabel.Text = (step >= 1) and tostring(math.floor(stepped + 0.5)) or tostring(stepped)
+                                callback(stepped)
+                        end
+                        update(input); local moveConn, relConn; sliderDragIndex += 1; local gestureId = "SliderDrag"..sliderDragIndex
+                        moveConn = UserInputService.InputChanged:Connect(function(moveInp)
+                                if dragging and (moveInp.UserInputType == Enum.UserInputType.MouseMovement or moveInp.UserInputType == Enum.UserInputType.Touch) then update(moveInp) end
+                        end)
+                        CleanupManager:AddConn(gestureId.."Move", moveConn)
+                        relConn = UserInputService.InputEnded:Connect(function(relInp)
+                                if relInp.UserInputType == Enum.UserInputType.MouseButton1 or relInp.UserInputType == Enum.UserInputType.Touch then
+                                        dragging = false; CleanupManager:RemoveConn(gestureId.."Move"); CleanupManager:RemoveConn(gestureId.."End")
+                                end
+                        end)
+                        CleanupManager:AddConn(gestureId.."End", relConn)
+                end
+        end)
+end
+-- Toggles & Sliders
+createToggle("Enable Aimbot", State.Aimbot, function(v) State.Aimbot = v end)
+createModeSelector("Target Part", { "Head", "Torso", "Random" }, 1, function(v) State.TargetPartMode = v end)
+createToggle("Show FOV Circle", State.ShowFOV, function(v) State.ShowFOV = v end)
+createToggle("Team Check", State.TeamCheck, function(v) State.TeamCheck = v end)
+createToggle("Wall Check", State.WallCheck, function(v) State.WallCheck = v end)
+createToggle("Prediction Engine", State.Prediction, function(v) State.Prediction = v end)
+createToggle("Ping Compensation", State.PingCompensation, function(v) State.PingCompensation = v end)
+createToggle("Drop Value Mode: Multiplier", State.DropIsMultiplier, function(v)
+        State.DropIsMultiplier = v
+        if WeaponService then if WeaponService.InvalidateCache then WeaponService:InvalidateCache() end; WeaponService:UpdateAuto() end
+end)
+createToggle("Auto Weapon Speed", State.AutoBulletSpeed, function(v)
+        State.AutoBulletSpeed = v; if WeaponService then WeaponService:UpdateAuto() end
+end)
+createToggle("ESP Wallhack", State.ESP, function(v)
+        State.ESP = v; if ESPService and clearESPVisuals and not v then clearESPVisuals(true, false) end
+end)
+createToggle("ESP Username", State.ESPName, function(v)
+        State.ESPName = v; if ESPService and clearESPVisuals and not v then clearESPVisuals(false, true) end
+end)
+createSlider("Manual Bullet Speed", 500, 10000, State.BulletSpeed, 100, function(v) State.BulletSpeed = v; if WeaponService then WeaponService:UpdateManual() end end)
+createSlider("Manual Gravity", 0, 500, State.BulletGravity, 10, function(v) State.BulletGravity = v; if WeaponService then WeaponService:UpdateManual() end end)
+createSlider("Aim Speed", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
+createSlider("Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
+createSlider("Pred Reactivity", 0.2, 3, State.PredReactivity, 0.05, function(v) State.PredReactivity = v end)
+createSlider("Pred Max Slew (s/s)", 0.5, 10, State.PredMaxSlew, 0.5, function(v) State.PredMaxSlew = v end)
+createToggle("Lag Comp", State.LagComp, function(v) State.LagComp = v end)
+createSlider("Catch-Up Boost", 0, 3, State.TrackBoost, 0.05, function(v) State.TrackBoost = v end)
+createToggle("Drag To Switch", State.DragSwitch, function(v) State.DragSwitch = v end)
+createToggle("Free Steer", State.FreeSteer, function(v) State.FreeSteer = v end)
+createToggle("Switch Assist", State.SwitchAssist, function(v) State.SwitchAssist = v end)
+createSlider("Flick Speed (°/s)", 60, 300, State.FlickSpeed, 5, function(v) State.FlickSpeed = v end)
+createToggle("Weapon Check", State.WeaponCheck, function(v) State.WeaponCheck = v end)
+createToggle("Teleport System", State.Teleport, function(v)
+        State.Teleport = v; if TPService and TPService.setEnabled then TPService.setEnabled(v) end
+        if not v then setGlxStatus(M11) end
+end)
+if TPService and TPService.setEnabled then TPService.setEnabled(State.Teleport) end
+
+setGlxStatus(M3)
+-- ==========================================
+-- 3.9 TELEPORT SYSTEM
+-- ==========================================
+do
+        local DIST = 10; local TAP_SLOP = 8
+        local tpGui = Instance.new("ScreenGui"); tpGui.Name = "Glx_BehindTP"; tpGui.ResetOnSpawn = false
+        tpGui.DisplayOrder = 999998; tpGui.Parent = ScreenGui.Parent or game:GetService("CoreGui"); tpGui.Enabled = false
+        CleanupManager:AddInstance("TPGui", tpGui)
+        local box = Instance.new("Frame"); box.Size = UDim2.fromOffset(44, 44); box.Position = UDim2.new(0, 84, 0, 130)
+        box.BackgroundColor3 = Color3.fromRGB(18, 18, 18); box.BackgroundTransparency = 0.2; box.BorderSizePixel = 0
+        box.Active = true; box.Parent = tpGui; Instance.new("UICorner", box).CornerRadius = UDim.new(0, 10)
+        local tpBtn = Instance.new("TextButton"); tpBtn.Size = UDim2.fromScale(1, 1); tpBtn.BackgroundTransparency = 1
+        tpBtn.Font = Enum.Font.GothamBold; tpBtn.TextSize = 15; tpBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+        tpBtn.Text = "TP"; tpBtn.Parent = box
+        local lockBadge = Instance.new("TextButton"); lockBadge.Size = UDim2.fromOffset(18, 18)
+        lockBadge.Position = UDim2.new(1, -8, 0, -8); lockBadge.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+        lockBadge.BorderSizePixel = 0; lockBadge.Font = Enum.Font.SourceSans; lockBadge.TextSize = 12
+        lockBadge.Text = "\u{1F513}"; lockBadge.Parent = box; Instance.new("UICorner", lockBadge).CornerRadius = UDim.new(1, 0)
+
+        local function pickTarget()
+                local cam = Workspace.CurrentCamera; if not cam then return nil end
+                local rayParams = RaycastParams.new(); rayParams.FilterType = Enum.RaycastFilterType.Exclude
+                local myChar = LocalPlayer.Character; rayParams.FilterDescendantsInstances = myChar and { myChar } or {}
+                local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 1000, rayParams)
+                local model = hit and hit.Instance:FindFirstAncestorOfClass("Model")
+                if not (model and model:FindFirstChildOfClass("Humanoid")) then
+                        local vp = cam.ViewportSize / 2; local best, bestDist
+                        for _, plr in Players:GetPlayers() do
+                                if plr ~= LocalPlayer and not (LocalPlayer.Team ~= nil and plr.Team == LocalPlayer.Team) then
+                                        local char = plr.Character; local hum = char and char:FindFirstChildOfClass("Humanoid")
+                                        local root = char and char:FindFirstChild("HumanoidRootPart")
+                                        if hum and root and hum.Health > 0 then
+                                                local sp, on = cam:WorldToViewportPoint(root.Position)
+                                                if on then
+                                                        local d = (Vector2.new(sp.X, sp.Y) - vp).Magnitude
+                                                        if not bestDist or d < bestDist then best, bestDist = root, d end
+                                                end
+                                        end
+                                end
+                        end
+                        return best
+                end
+                local plr = Players:GetPlayerFromCharacter(model)
+                if plr and plr ~= LocalPlayer and not (LocalPlayer.Team ~= nil and plr.Team == LocalPlayer.Team) then
+                        local hum = model:FindFirstChildOfClass("Humanoid"); local root = model:FindFirstChild("HumanoidRootPart")
+                        if hum and root and hum.Health > 0 then return root end
+                end
+                return nil
+        end
+
+        local function teleport()
+                local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not myRoot then return end
+                local target = pickTarget(); if not target then setGlxStatus(T{216,128,190,219,132,156,222,134,200,161,250,221,164,253,220,215,129,185,218,131,167,221,135,182,160,249,240,163,252,238,166,143,153,217,130,137,220,133,156,223,248,219,162,251,221,165,254,156,216,129,163,219,133,180,222,135,242,161,250,203,164,253,235}); return end
+                local spot = target.CFrame * CFrame.new(0, 0, DIST)
+                local lv = target.CFrame.LookVector; local face = Vector3.new(lv.X, 0, lv.Z)
+                face = face.Magnitude > 0.05 and face.Unit or Vector3.new(0, 0, -1)
+                myRoot.CFrame = CFrame.lookAt(spot.Position, spot.Position + face)
+                setGlxStatus(T{216,128,186,219,132,170,222,134,192,161,250,230,164,253,216,215,128,148,218,131,159,221,135,179,160,249,215,163,252,239,166,143,139,217,131,187,220,133,157,223,249,198,162,251,204})
+        end
+
+        local locked = false; local dragInput, dragStart, startPos
+        local function isPress(io) return io.UserInputType == Enum.UserInputType.Touch or io.UserInputType == Enum.UserInputType.MouseButton1 end
+        tpBtn.InputBegan:Connect(function(io) if isPress(io) then dragInput, dragStart, startPos = io, io.Position, box.Position end end)
+        CleanupManager:AddConn("TPDragMoved", UserInputService.InputChanged:Connect(function(io)
+                if io ~= dragInput or locked then return end
+                local d = io.Position - dragStart; box.Position = startPos + UDim2.fromOffset(d.X, d.Y)
+        end))
+        CleanupManager:AddConn("TPDragEnded", UserInputService.InputEnded:Connect(function(io)
+                if io ~= dragInput then return end; dragInput = nil
+                if (io.Position - dragStart).Magnitude <= TAP_SLOP then teleport() end
+        end))
+        lockBadge.Activated:Connect(function() locked = not locked; lockBadge.Text = locked and "\u{1F512}" or "\u{1F513}" end)
+        TPService = { setEnabled = function(on) tpGui.Enabled = on and true or false end }
+end
+
+print("[GLX v3.14-FIX] PART 1/5 loaded — UI + Teleport ready")
+-- =====================================================================
+-- Part 2/5: Weapon Service + Visibility Service + Enemy Validity
+-- GLX_aimbot_v3.14_Fixed
+-- ต้องมี Part 1/5 รันก่อน (CleanupManager, State, getCamera, getPing, safeUnit, isFiniteVec3)
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+local FALLBACK_SPEED = 3000  -- ต้องตรงกับ Part 1
+
+-- ==========================================
+-- 4. WEAPON SERVICE
+-- ==========================================
+WeaponService = { Speed = FALLBACK_SPEED, Gravity = workspace.Gravity }
+function WeaponService:UpdateManual()
+        if not State.AutoBulletSpeed then
+                self.Speed = math.max(State.BulletSpeed or FALLBACK_SPEED, 1)
+                self.Gravity = State.BulletGravity or workspace.Gravity
+        end
+end
+local WeaponCache = setmetatable({}, { __mode = "k" })
+function WeaponService:InvalidateCache() table.clear(WeaponCache) end
+function WeaponService:UpdateAuto()
+        if not State.AutoBulletSpeed then return self:UpdateManual() end
+        local char = LocalPlayer and LocalPlayer.Character; local tool = char and char:FindFirstChildOfClass("Tool")
+        if not tool then self.Speed = FALLBACK_SPEED; self.Gravity = workspace.Gravity; return end
+        local cached = WeaponCache[tool]
+        if cached then self.Speed = cached.Speed; self.Gravity = cached.Gravity; return end
+        local toolName = tool.Name:lower()
+        local isLauncher = toolName:find("rpg") or toolName:find("rocket") or toolName:find("launcher") or toolName:find("grenade")
+        local acsSettings = tool:FindFirstChild("ACS_Settings") or tool:FindFirstChild("Settings") or tool:FindFirstChild("Config")
+        local speed, gravity = FALLBACK_SPEED, workspace.Gravity
+        if acsSettings and acsSettings:IsA("ModuleScript") then
+                local success, config = pcall(require, acsSettings)
+                if success and type(config) == "table" then
+                        local s = config.Velo or config.MuzzleVelocity or config.BulletSpeed or config.Velocity
+                        speed = (type(s) == "number" and s > 0) and s or speed
+                        local drop = config.Drop or config.BulletDrop or config.Gravity
+                        if type(drop) == "number" then
+                                gravity = State.DropIsMultiplier and (workspace.Gravity * drop) or drop
+                        else
+                                gravity = (isLauncher and not toolName:find("grenade")) and 0 or workspace.Gravity
+                        end
+                end
+        end
+        WeaponCache[tool] = { Speed = speed, Gravity = gravity }; self.Speed = speed; self.Gravity = gravity
+end
+
+local HookedTools = setmetatable({}, { __mode = "k" })
+local CONFIG_HINTS = { "acs_settings", "settings", "config" }
+local function hookToolConfigWatcher(tool)
+        if HookedTools[tool] then return end; HookedTools[tool] = true
+        tool.ChildAdded:Connect(function(child)
+                local childName = child.Name:lower()
+                for _, hint in ipairs(CONFIG_HINTS) do
+                        if childName:find(hint) then
+                                WeaponCache[tool] = nil
+                                local char = LocalPlayer and LocalPlayer.Character
+                                if char and char:FindFirstChildOfClass("Tool") == tool then WeaponService:UpdateAuto() end
+                                break
+                        end
+                end
+        end)
+end
+local function setupCharacterWeaponListener(char)
+        if not char then return end
+        CleanupManager:AddConn("ToolAdded", char.ChildAdded:Connect(function(child)
+                if child:IsA("Tool") then
+                        hookToolConfigWatcher(child)
+                        task.defer(function() WeaponService:UpdateAuto() end)
+                end
+        end))
+        CleanupManager:AddConn("ToolRemoved", char.ChildRemoved:Connect(function() task.defer(function() WeaponService:UpdateAuto() end) end))
+        WeaponService:UpdateAuto()
+end
+if LocalPlayer then
+        if LocalPlayer.Character then setupCharacterWeaponListener(LocalPlayer.Character) end
+        CleanupManager:AddConn("CharAdded", LocalPlayer.CharacterAdded:Connect(setupCharacterWeaponListener))
+end
+
+-- ==========================================
+-- 5. VISIBILITY SERVICE
+-- ==========================================
+local VisibilityService = {}
+local RayParams = RaycastParams.new(); RayParams.FilterType = Enum.RaycastFilterType.Exclude; RayParams.IgnoreWater = true
+local ScratchFilter = {}; local lastFilterCount, lastFilterFirst = -1, nil
+
+function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specificPart)
+        local camera = getCamera(); if not (camera and targetCharacter) then return false end
+        local targetPart = specificPart
+        if not (targetPart and targetPart.Parent) then targetPart = targetCharacter:FindFirstChild("Head") or targetCharacter:FindFirstChild("HumanoidRootPart") end
+        if not targetPart then return false end
+        local origin = camera.CFrame.Position; local targetPos = targetPart.Position; local direction = targetPos - origin
+        local distToTarget = direction.Magnitude; if distToTarget < 0.05 then return true end
+        local maxPierces = pierceCount or 1; local currentOrigin = origin; local currentDirection = direction
+        table.clear(ScratchFilter); local n = 0
+        local myChar = LocalPlayer and LocalPlayer.Character
+        if myChar then n += 1; ScratchFilter[n] = myChar end
+        local filterDirty = (n ~= lastFilterCount) or (ScratchFilter[1] ~= lastFilterFirst)
+        for i = 1, maxPierces do
+                if filterDirty then lastFilterCount, lastFilterFirst = n, ScratchFilter[1]; RayParams.FilterDescendantsInstances = ScratchFilter; filterDirty = false end
+                local okRay, result = pcall(Workspace.Raycast, Workspace, currentOrigin, currentDirection, RayParams)
+                if not okRay or not result then return true end
+                local hitDist = result.Distance; if math.abs(hitDist - distToTarget) < 0.03 then return true end
+                local hitPart = result.Instance; if hitPart:IsDescendantOf(targetCharacter) then return true end
+                if i < maxPierces and (hitPart.Transparency > 0.8 or not hitPart.CanCollide) then
+                        n += 1; ScratchFilter[n] = hitPart; filterDirty = true
+                        local seg = targetPos - result.Position; local segUnit = safeUnit(seg); if not segUnit then return true end
+                        currentOrigin = result.Position + segUnit * 0.05; currentDirection = seg
+                else return false end
+        end
+        filterDirty = false; return false
+end
+
+-- ==========================================
+-- 5.1 ENEMY VALIDITY
+-- ==========================================
+local PlayerCache = setmetatable({}, { __mode = "k" })
+local function getComponents(player)
+        local char = player.Character; if not char then PlayerCache[player] = nil; return nil end
+        local entry = PlayerCache[player]
+        if not entry or entry.Character ~= char then
+                entry = { Character = char, Humanoid = char:FindFirstChildOfClass("Humanoid"), Root = char:FindFirstChild("HumanoidRootPart") }
+                PlayerCache[player] = entry
+        end
+        if entry.Humanoid and entry.Humanoid.Parent ~= char then entry.Humanoid = nil end
+        if not entry.Humanoid then entry.Humanoid = char:FindFirstChildOfClass("Humanoid") end
+        if entry.Root and entry.Root.Parent ~= char then entry.Root = nil end
+        if not entry.Root then entry.Root = char:FindFirstChild("HumanoidRootPart") end
+        return entry
+end
+local function isValidEnemy(player)
+        if not player or player == LocalPlayer then return false end
+        local entry = getComponents(player); if not entry then return false end
+        local humanoid, root = entry.Humanoid, entry.Root
+        if not humanoid or humanoid.Health <= 0 then return false end
+        if not root or root.Parent ~= entry.Character then return false end
+        local nowFF = os.clock()
+        if nowFF >= (entry.FFCheckUntil or 0) then
+                entry.HasForceField = entry.Character:FindFirstChildOfClass("ForceField") ~= nil; entry.FFCheckUntil = nowFF + 0.25
+        end
+        if entry.HasForceField then return false end
+        if State.TeamCheck then
+                if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then return false end
+                if player.TeamColor and LocalPlayer.TeamColor and player.TeamColor == LocalPlayer.TeamColor then return false end
+        end
+        return true
+end
+CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(function(player) PlayerCache[player] = nil end))
+
+print("[GLX v3.14-FIX] PART 2/5 loaded — Weapon + Visibility + EnemyValidity ready")
+-- =====================================================================
+-- Part 3/5: Target Service (Acquire/Keep/CheckSwitch) + Prediction Engine
+-- GLX_aimbot_v3.14_Fixed
+-- ต้องมี Part 1+2 รันก่อน (CleanupManager, State, getCamera, getPing, safeUnit, isFiniteVec3, VisibilityService, isValidEnemy)
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+-- ==========================================
+-- 6. TARGET SERVICE
+-- ==========================================
+local TARGET_GRACE = 0.25; local KEEP_HYSTERESIS = 1.35; local ZOOM_TAU = 0.08
+local targetGraceUntil = 0; local zoomSmoothed = nil; local keepWallCheckUntil, keepWallVisible = 0, true
+local SWITCH_COOLDOWN = 0.30; local switchAwayKey = nil; local switchCooldownUntil = 0
+local SWITCH_RATIO = 0.50; local SWITCH_CHECK_INTERVAL = 0.05; local lastSwitchCheck = 0
+local ACQUIRE_INTERVAL = 1 / 30; local lastAcquireAt = 0
+
+local TargetService = { CurrentTarget = nil, TargetPart = nil, LockedPartName = nil }
+local RANDOM_PARTS = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" }
+
+function TargetService:GetTargetPart(char)
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if State.TargetPartMode == "Head" then return char:FindFirstChild("Head") or root end
+        if State.TargetPartMode == "Random" then
+                if self.LockedPartName then local locked = char:FindFirstChild(self.LockedPartName); if locked then return locked end end
+                local name = RANDOM_PARTS[math.random(1, #RANDOM_PARTS)]; local picked = char:FindFirstChild(name)
+                if not picked then picked = root; name = "HumanoidRootPart" end
+                self.LockedPartName = name; return picked
+        end
+        return root
+end
+function TargetService:ReleaseTarget()
+        self.CurrentTarget = nil; self.TargetPart = nil; self.LockedPartName = nil
+        targetGraceUntil = 0; keepWallCheckUntil = 0; keepWallVisible = true
+end
+function TargetService:KeepTarget(camera, screenX, screenY, scaledFOV)
+        local target = self.CurrentTarget; if not isValidEnemy(target) then return false, false end
+        local part = self.TargetPart; if not (part and part.Parent and part:IsDescendantOf(target.Character)) then return false, false end
+        if State.WallCheck then
+                local nowWC = os.clock()
+                if nowWC >= (keepWallCheckUntil or 0) then keepWallCheckUntil = nowWC + (1/15); keepWallVisible = VisibilityService:CheckVisibility(target.Character, 1, part) end
+                if not keepWallVisible then return false, false end
+        end
+        local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
+        if not onScreen or screenPoint.Z <= 0 then return false, true end
+        local dx = screenPoint.X - screenX; local dy = screenPoint.Y - screenY
+        local keepRadius = scaledFOV * KEEP_HYSTERESIS; return dx*dx + dy*dy <= keepRadius*keepRadius, false
+end
+function TargetService:AcquireTarget(camera, screenX, screenY, scaledFOV)
+        local closestDistSq = scaledFOV * scaledFOV; local banRadiusSq = (scaledFOV*0.12)*(scaledFOV*0.12)
+        local closestPlayer, bestPart = nil, nil; local now = os.clock()
+        local cooldownActive = switchCooldownUntil > now and switchAwayKey ~= nil
+        local players = Players:GetPlayers()
+        for i = 1, #players do
+                local player = players[i]
+                if not isValidEnemy(player) then continue end
+                local part = self:GetTargetPart(player.Character); if not part then continue end
+                local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position); if not onScreen or screenPoint.Z <= 0 then continue end
+                local dx = screenPoint.X - screenX; local dy = screenPoint.Y - screenY; local distSq = dx*dx + dy*dy
+                if distSq >= closestDistSq then continue end
+                local banned = cooldownActive and player == switchAwayKey; if banned and distSq > banRadiusSq then continue end
+                if State.WallCheck and not VisibilityService:CheckVisibility(player.Character, 1, part) then continue end
+                closestDistSq = distSq; closestPlayer = player; bestPart = part
+        end
+        if closestPlayer then
+                if closestPlayer ~= self.CurrentTarget then self.LockedPartName = nil end
+                self.CurrentTarget = closestPlayer; self.TargetPart = bestPart
+        end
+end
+function TargetService:CheckSwitch(camera, screenX, screenY, scaledFOV)
+        local now = os.clock(); if now - lastSwitchCheck < SWITCH_CHECK_INTERVAL then return end; lastSwitchCheck = now
+        local target = self.CurrentTarget; local part = self.TargetPart; if not (target and part and part.Parent) then return end
+        local myPoint, myOn = camera:WorldToViewportPoint(part.Position); if not (myOn and myPoint.Z > 0) then return end
+        local myDx, myDy = myPoint.X - screenX, myPoint.Y - screenY; local myDistSq = myDx*myDx + myDy*myDy
+        local limitSq = math.min(myDistSq * (SWITCH_RATIO*SWITCH_RATIO), scaledFOV*scaledFOV); if limitSq <= 0 then return end
+        local cooldownActive = switchCooldownUntil > now and switchAwayKey ~= nil; local banRadiusSq = (scaledFOV*0.12)*(scaledFOV*0.12)
+        local bestDistSq = limitSq; local bestPlayer, bestPart = nil, nil
+        local players = Players:GetPlayers()
+        for i = 1, #players do
+                local player = players[i]
+                if player == target then continue end; if not isValidEnemy(player) then continue end
+                local cand = self:GetTargetPart(player.Character); if not cand then continue end
+                local sp, onScreen = camera:WorldToViewportPoint(cand.Position); if not onScreen or sp.Z <= 0 then continue end
+                local dx = sp.X - screenX; local dy = sp.Y - screenY; local distSq = dx*dx + dy*dy
+                if distSq >= bestDistSq then continue end
+                local banned = cooldownActive and player == switchAwayKey; if banned and distSq > banRadiusSq then continue end
+                bestDistSq = distSq; bestPlayer = player; bestPart = cand
+        end
+        if bestPlayer and (not State.WallCheck or VisibilityService:CheckVisibility(bestPlayer.Character, 1, bestPart)) then
+                switchAwayKey = target; switchCooldownUntil = now + SWITCH_COOLDOWN
+                self.CurrentTarget = bestPlayer; self.TargetPart = bestPart; self.LockedPartName = nil
+                targetGraceUntil = 0; keepWallCheckUntil = 0; keepWallVisible = true
+        end
+end
+
+-- ==========================================
+-- 7. ADVANCED PREDICTION ENGINE
+-- ==========================================
+local TargetStates = setmetatable({}, { __mode = "k" })
+local MAX_SAMPLE_DT = 0.1; local MAX_PREDICTION_TIME = 5.0
+local MAX_DV_PER_SAMPLE = 35; local SPIKE_COOLDOWN = 0.15; local MAX_ACCEL = 200
+local ACCEL_TAU_BASE = 0.10; local MAX_ACCEL_LEAD = 12; local VEL_TAU = 0.05; local VELOCITY_SANITY = 3000
+
+local function clampAccelLead(v3, cap) local m = v3.Magnitude; if m > cap then return v3 * (cap/m) end; return v3 end
+
+task.spawn(function()
+        while getgenv().Glx_Cleanup == CleanupManager and task.wait(10) do
+                for part in pairs(TargetStates) do
+                        if typeof(part) ~= "Instance" or not part:IsDescendantOf(workspace) then TargetStates[part] = nil end
+                end
+        end
+end)
+CleanupManager:AddCustomCleanup(function() table.clear(TargetStates) end)
+
+local function getKinematicPart(targetPart)
+        local parent = targetPart.Parent
+        if parent then local root = parent:FindFirstChild("HumanoidRootPart"); if root and root:IsA("BasePart") then return root end end
+        return targetPart
+end
+
+local function getTargetAcceleration(kinPart, targetVel, currentTime)
+        local state = TargetStates[kinPart]
+        local velSane = isFiniteVec3(targetVel) and targetVel.Magnitude <= VELOCITY_SANITY
+        if not velSane then
+                if state then
+                        state.lastVelocity = isFiniteVec3(state.lastVelocity) and state.lastVelocity or Vector3.zero
+                        state.lastTime = currentTime; state.smoothedAcceleration = Vector3.zero
+                        state.spikeUntil = currentTime + SPIKE_COOLDOWN; state.lastPredictionTime = nil
+                        if not isFiniteVec3(state.smoothedVelocity) then state.smoothedVelocity = Vector3.zero end
+                end
+                local outVel = state and state.smoothedVelocity; return Vector3.zero, (isFiniteVec3(outVel) and outVel) or Vector3.zero
+        end
+        if state then
+                if not isFiniteVec3(state.smoothedVelocity) then state.smoothedVelocity = targetVel end
+                if not isFiniteVec3(state.smoothedAcceleration) then state.smoothedAcceleration = Vector3.zero end
+        end
+        if not state then
+                TargetStates[kinPart] = { lastVelocity = targetVel, lastTime = currentTime, smoothedAcceleration = Vector3.zero, smoothedVelocity = targetVel, lastPredictionTime = nil, spikeUntil = 0, samples = 1 }
+                return Vector3.zero, targetVel
+        end
+        local previousVelocity = state.lastVelocity; local previousTime = state.lastTime; local dt = currentTime - previousTime
+        if dt <= 0 then return state.smoothedAcceleration or Vector3.zero, state.smoothedVelocity or targetVel end
+        if dt > MAX_SAMPLE_DT then
+                state.lastVelocity = targetVel; state.lastTime = currentTime; state.smoothedAcceleration = Vector3.zero
+                state.smoothedVelocity = targetVel; state.lastPredictionTime = nil; state.spikeUntil = 0
+                return Vector3.zero, targetVel
+        end
+        state.lastVelocity = targetVel; state.lastTime = currentTime; state.samples += 1
+        local velAlpha = 1 - math.exp(-dt / VEL_TAU)
+        if currentTime < state.spikeUntil then
+                state.smoothedAcceleration = Vector3.zero; state.smoothedVelocity = state.smoothedVelocity:Lerp(targetVel, velAlpha)
+                return Vector3.zero, state.smoothedVelocity
+        end
+        local dv = targetVel - previousVelocity
+        if dv.Magnitude > MAX_DV_PER_SAMPLE then
+                state.spikeUntil = currentTime + SPIKE_COOLDOWN; state.smoothedAcceleration = Vector3.zero
+                state.smoothedVelocity = state.smoothedVelocity:Lerp(targetVel, velAlpha); return Vector3.zero, state.smoothedVelocity
+        end
+        local rawAcceleration = dv / dt; state.smoothedVelocity = state.smoothedVelocity:Lerp(targetVel, velAlpha)
+        local tau = ACCEL_TAU_BASE / math.clamp(State.PredReactivity or 1.0, 0.2, 3); local alpha = 1 - math.exp(-dt / tau)
+        state.smoothedAcceleration = state.smoothedAcceleration:Lerp(rawAcceleration, alpha)
+        local accelMag = state.smoothedAcceleration.Magnitude
+        if accelMag > MAX_ACCEL then state.smoothedAcceleration = state.smoothedAcceleration * (MAX_ACCEL / accelMag) end
+        return state.smoothedAcceleration, state.smoothedVelocity
+end
+
+local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec, deltaTime, leadTime, zoomScale)
+        if typeof(bulletSpeed) ~= "number" or bulletSpeed <= 0 then return nil end
+        if typeof(shooterPos) ~= "Vector3" then return nil end
+        if typeof(bulletGravityVec) ~= "Vector3" then return nil end
+        if not targetPart or not targetPart:IsA("BasePart") then return nil end
+        local dt = deltaTime or (1/60); local currentTime = os.clock(); local targetPos = targetPart.Position
+        local kinPart = getKinematicPart(targetPart); local targetAcc, targetVel = getTargetAcceleration(kinPart, kinPart.AssemblyLinearVelocity, currentTime)
+        local pingOffset = (State.PingCompensation and (getPing()*0.5) or 0) + (leadTime or 0); local accelLeadCap = MAX_ACCEL_LEAD / (zoomScale or getZoomScale(getCamera()))
+        local function f(t)
+                local totalT = t + pingOffset
+                local targetAtT = targetPos + (targetVel*totalT) + clampAccelLead(0.5*targetAcc*(totalT^2), accelLeadCap)
+                local bulletDropAtT = 0.5*bulletGravityVec*(t^2); local requiredDisplacement = targetAtT - shooterPos - bulletDropAtT
+                return (bulletSpeed*t) - requiredDisplacement.Magnitude
+        end
+        local t0 = 0; local initialDist = (targetPos - shooterPos).Magnitude; local t1 = (initialDist/bulletSpeed) + pingOffset
+        if t1 <= 0 then return safeUnit(targetPos - shooterPos) end
+        local f0 = f(t0); local f1 = f(t1); local t_intercept = t1; local tolerance = 0.001
+        for _ = 1, 8 do
+                if math.abs(f1 - f0) < 1e-6 then break end
+                local next_t = t1 - f1*(t1-t0)/(f1-f0)
+                if next_t ~= next_t or next_t == math.huge or next_t == -math.huge then t_intercept = t1; break end
+                t_intercept = math.clamp(next_t, 0, MAX_PREDICTION_TIME); if math.abs(t_intercept - t1) < tolerance then break end
+                t0, f0 = t1, f1; t1 = t_intercept; f1 = f(t1)
+        end
+        local state = TargetStates[kinPart]
+        if state then
+                local prevPredictionTime = state.lastPredictionTime
+                if prevPredictionTime then
+                        local maxDelta = (State.PredMaxSlew or 3.0) * dt
+                        t_intercept = prevPredictionTime + math.clamp(t_intercept - prevPredictionTime, -maxDelta, maxDelta)
+                end
+                state.lastPredictionTime = t_intercept
+        end
+        local finalT = t_intercept + pingOffset
+        local finalTargetPos = targetPos + (targetVel*finalT) + clampAccelLead(0.5*targetAcc*(finalT^2), accelLeadCap)
+        local displacement = finalTargetPos - shooterPos
+        if t_intercept > 0 then
+                local requiredVelocity = (displacement/t_intercept) - (0.5*bulletGravityVec*t_intercept)
+                local finalUnit = safeUnit(requiredVelocity); if finalUnit then return finalUnit end
+        end
+        return safeUnit(displacement)
+end
+
+local lastGravVal, lastGravVec = nil, nil
+local predFallbackStreak = 0
+local function getPredictedPosition(targetPart, shooterPos, deltaTime, leadTime, zoomScale)
+        local targetPos = targetPart.Position
+        if not State.Prediction then
+                lastGravVal, lastGravVec = nil, nil
+                if leadTime and leadTime > 0 then
+                        local kinPart = getKinematicPart(targetPart)
+                        if kinPart then
+                                local _, vel = getTargetAcceleration(kinPart, kinPart.AssemblyLinearVelocity, os.clock())
+                                if vel and vel.Magnitude > 1e-3 and vel.Magnitude <= VELOCITY_SANITY then targetPos += vel * leadTime end
+                        end
+                end
+                return targetPos
+        end
+        if lastGravVal ~= WeaponService.Gravity then lastGravVal = WeaponService.Gravity; lastGravVec = Vector3.new(0, -lastGravVal, 0) end
+        local bulletSpeed = math.max(WeaponService.Speed, 1)
+        local aimDirection = solveInterceptVector(shooterPos, targetPart, bulletSpeed, lastGravVec, deltaTime, leadTime, zoomScale)
+        if aimDirection then predFallbackStreak = 0; return shooterPos + (aimDirection*10000) end
+        predFallbackStreak += 1
+        if predFallbackStreak % 60 == 1 then setGlxStatus("prediction fallback streak "..predFallbackStreak.." (bullet="..math.floor(bulletSpeed)..")") end
+        return targetPos
+end
+
+print("[GLX v3.14-FIX] PART 3/5 loaded — TargetService + Prediction ready")
+-- =====================================================================
+-- Part 4/5: ESP Service (ProcessESP + sweeper + helpers)
+-- GLX_aimbot_v3.14_Fixed
+-- ต้องมี Part 1+2+3 รันก่อน (CleanupManager, State, VisibilityService, isValidEnemy, setStickyStatus)
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ==========================================
+-- 8. ESP SERVICE
+-- ==========================================
+ESPService = {
+        Cache = {},
+        COLOR_VISIBLE = Color3.fromRGB(0, 255, 128),
+        COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50),
+        OUTLINE_VISIBLE = Color3.fromRGB(255, 215, 0),
+        OUTLINE_OBSTRUCTED = Color3.fromRGB(100, 0, 0)
+}
+local ESPRegistry = setmetatable({}, { __mode = "k" })
+
+local function destroyEntryVisuals(entry)
+        if not entry then return end
+        if entry.Highlight then pcall(entry.Highlight.Destroy, entry.Highlight); entry.Highlight = nil end
+        if entry.NameTag then pcall(entry.NameTag.Destroy, entry.NameTag); entry.NameTag = nil end
+        entry.Label = nil; entry.ShownVisible = nil
+end
+
+function ESPService:ClearAll()
+        for _, player in ipairs(Players:GetPlayers()) do
+                local char = player.Character
+                if char then
+                        local hl = char:FindFirstChild("ESP_Highlight"); if hl then hl:Destroy() end
+                        local nt = char:FindFirstChild("ESP_NameTag"); if nt then nt:Destroy() end
+                end
+        end
+        table.clear(self.Cache)
+end
+CleanupManager:AddCustomCleanup(function() ESPService:ClearAll() end)
+CleanupManager:AddConn("PlayerRemovingESP", Players.PlayerRemoving:Connect(function(player)
+        destroyEntryVisuals(ESPService.Cache[player]); ESPService.Cache[player] = nil
+end))
+
+clearESPVisuals = function(highlightToo, nameTagToo)
+        for _, entry in pairs(ESPService.Cache) do
+                if highlightToo and entry.Highlight then pcall(entry.Highlight.Destroy, entry.Highlight); entry.Highlight = nil; entry.ShownVisible = nil end
+                if nameTagToo and entry.NameTag then pcall(entry.NameTag.Destroy, entry.NameTag); entry.NameTag = nil; entry.Label = nil end
+        end
+end
+
+local function buildNameTag(char, head, text)
+        local nameTag = Instance.new("BillboardGui"); nameTag.Name = "ESP_NameTag"; nameTag.Adornee = head
+        nameTag.Size = UDim2.new(0, 150, 0, 30); nameTag.StudsOffset = Vector3.new(0, 2, 0)
+        nameTag.AlwaysOnTop = true; nameTag.MaxDistance = 1500
+        local textLabel = Instance.new("TextLabel"); textLabel.Name = "TagLabel"; textLabel.Size = UDim2.new(1, 0, 1, 0)
+        textLabel.BackgroundTransparency = 1; textLabel.Text = text; textLabel.TextStrokeTransparency = 0
+        textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); textLabel.Font = Enum.Font.SourceSansBold; textLabel.TextSize = 14
+        textLabel.Parent = nameTag; nameTag.Parent = char; ESPRegistry[nameTag] = true; return nameTag
+end
+
+function ESPService:ProcessESP()
+        if not State.ESP and not State.ESPName then return end
+        local now = os.clock(); local players = Players:GetPlayers()
+        for i = 1, #players do
+                local player = players[i]
+                if player ~= LocalPlayer then
+                        local char = player.Character
+                        if not char then destroyEntryVisuals(self.Cache[player]); self.Cache[player] = nil
+                        else
+                                local entry = self.Cache[player]
+                                if not entry or entry.Character ~= char then
+                                        destroyEntryVisuals(entry)
+                                        entry = { Character = char, Visible = false, LastCheck = 0, Highlight = char:FindFirstChild("ESP_Highlight"), NameTag = char:FindFirstChild("ESP_NameTag"), ShownVisible = nil }
+                                        self.Cache[player] = entry
+                                end
+                                local isEnemy = isValidEnemy(player)
+                                if not isEnemy or (not State.ESP and not State.ESPName) then
+                                        if entry.Highlight then entry.Highlight:Destroy(); entry.Highlight = nil end
+                                        if entry.NameTag then entry.NameTag:Destroy(); entry.NameTag = nil end
+                                        entry.Label = nil; entry.ShownVisible = nil
+                                else
+                                        if now - entry.LastCheck >= 0.35 then entry.Visible = VisibilityService:CheckVisibility(char, 5, nil); entry.LastCheck = now end
+                                        if State.ESP then
+                                                local hl = entry.Highlight
+                                                if not hl or hl.Parent ~= char then
+                                                        if hl then pcall(hl.Destroy, hl) end
+                                                        hl = Instance.new("Highlight"); hl.Name = "ESP_Highlight"; hl.FillTransparency = 0.25
+                                                        hl.Parent = char; entry.Highlight = hl; ESPRegistry[hl] = true; entry.ShownVisible = nil
+                                                end
+                                                if entry.ShownVisible ~= entry.Visible then
+                                                        hl.FillColor = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+                                                        hl.OutlineColor = entry.Visible and self.OUTLINE_VISIBLE or self.OUTLINE_OBSTRUCTED
+                                                        entry.ShownVisible = entry.Visible
+                                                end
+                                        elseif entry.Highlight then entry.Highlight:Destroy(); entry.Highlight = nil; entry.ShownVisible = nil end
+                                        if State.ESPName then
+                                                local head = entry.Head; if head and head.Parent ~= char then head = nil; entry.Head = nil end
+                                                if not head then head = char:FindFirstChild("Head"); if head then entry.Head = head end end
+                                                if head then
+                                                        local nt = entry.NameTag
+                                                        if not nt or nt.Parent ~= char then
+                                                                entry.NameTag = buildNameTag(char, head, player.DisplayName or player.Name)
+                                                                nt = entry.NameTag; entry.Label = nt and nt:FindFirstChild("TagLabel") or nil
+                                                        end
+                                                        local label = entry.Label
+                                                        if label and label.Parent == nt then
+                                                                local color = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+                                                                if label.TextColor3 ~= color then label.TextColor3 = color end
+                                                        end
+                                                elseif entry.NameTag then entry.NameTag:Destroy(); entry.NameTag = nil; entry.Label = nil end
+                                        elseif entry.NameTag then entry.NameTag:Destroy(); entry.NameTag = nil; entry.Label = nil end
+                                end
+                        end
+                end
+        end
+end
+
+local espAccumulator = 0; local ESP_INTERVAL = 1/30; local lastEspTick = os.clock(); local espErrStreak = 0
+local espProcessFn = function() ESPService:ProcessESP() end
+local traceFn = function(e) local ok, tb = pcall(function() return debug.traceback(e) end); return ok and tb or tostring(e) end
+
+local function connectESP()
+        CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt)
+                lastEspTick = os.clock(); if not State.ESP and not State.ESPName then return end
+                espAccumulator += dt
+                if espAccumulator >= ESP_INTERVAL then
+                        espAccumulator = 0
+                        local ok, err = xpcall(espProcessFn, traceFn)
+                        if ok then espErrStreak = 0
+                        else
+                                espErrStreak += 1
+                                if espErrStreak == 5 then warn("[GLX v3.14] ESP tick error: "..tostring(err)); if setStickyStatus then setStickyStatus("ESP error: "..tostring(err):sub(1,40)) end end
+                        end
+                end
+        end))
+end
+connectESP()
+
+-- Sweeper: clean orphaned ESP tags every 5s
+task.spawn(function()
+        while getgenv().Glx_Cleanup == CleanupManager and task.wait(5) do
+                local owned
+                for _, entry in pairs(ESPService.Cache) do
+                        if entry.Highlight or entry.NameTag then owned = owned or {}; if entry.Highlight then owned[entry.Highlight] = true end; if entry.NameTag then owned[entry.NameTag] = true end end
+                end
+                local sweepRemove = {}
+                for inst in pairs(ESPRegistry) do
+                        if inst.Parent and not (owned and owned[inst]) then sweepRemove[#sweepRemove+1] = inst end
+                end
+                for _, inst in ipairs(sweepRemove) do ESPRegistry[inst] = nil; pcall(inst.Destroy, inst) end
+                for _, player in ipairs(Players:GetPlayers()) do
+                        local char = player.Character
+                        if char then
+                                for _, child in ipairs(char:GetChildren()) do
+                                        if (child.Name == "ESP_Highlight" or child.Name == "ESP_NameTag") and not (owned and owned[child]) then pcall(child.Destroy, child) end
+                                end
+                        end
+                end
+        end
+end)
+
+print("[GLX v3.14-FIX] PART 4/5 loaded — ESP Service ready")
+-- =====================================================================
+-- Part 5/5: Main Camera Engine + Watchdog + FPS Meter + Load Report
+-- GLX_aimbot_v3.14_Fixed
+-- ต้องมี Part 1-4 รันก่อน (ทุก service, State, TargetService, getPredictedPosition)
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ==========================================
+-- 9. MAIN CAMERA ENGINE
+-- ==========================================
+local FOVCircle
+do
+        local okDraw, drawObj = pcall(function() return Drawing.new("Circle") end)
+        if okDraw and drawObj then FOVCircle = drawObj
+        else FOVCircle = { Visible = false, Position = Vector2.new(0,0), Radius = 0, Thickness = 1.5, Color = Color3.fromRGB(255,255,255), Filled = false, Transparency = 0.7, NumSides = 3, Remove = function() end }
+                setGlxStatus(M4) end
+end
+FOVCircle.Thickness = 1.5; FOVCircle.Color = Color3.fromRGB(255,255,255); FOVCircle.Filled = false
+FOVCircle.Transparency = 0.7; FOVCircle.NumSides = 64; FOVCircle.Visible = false
+CleanupManager:AddDrawing("FOVCircle", FOVCircle)
+
+local function hasActiveWeapon()
+        local character = LocalPlayer and LocalPlayer.Character; if not character then return false end
+        if State.WeaponCheck == false then return true end; return character:FindFirstChildOfClass("Tool") ~= nil
+end
+
+print(M8)
+
+local flickUntil = 0; local flickArmStart = nil; local FLICK_ARM = 0.06; local prevReadLook = nil; local lastWriteLook = nil
+local FLICK_HOLD = 0.10; local STEER_DPS = 30; local STEER_HOLD = 0.22; local STEER_MIN_INFLUENCE = 0.15; local STEER_TAU = 0.07
+local steerInfluence = 1; local steerHoldStart = nil; local prevErrDeg = nil; local lastRenderTick = os.clock(); local renderErrStreak = 0
+
+local function renderTick(deltaTime)
+        local camera = getCamera(); if not camera then return end
+        local aiming = State.Aimbot and hasActiveWeapon(); local userDps = 0
+        if not aiming then
+                prevReadLook = camera.CFrame.LookVector; lastWriteLook = nil
+                if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
+                prevErrDeg = nil; steerInfluence = 1; steerHoldStart = nil; flickArmStart = nil
+        end
+        if aiming then
+                local userLook = camera.CFrame.LookVector; local dtSafe = math.max(deltaTime, 1e-4); userDps = math.huge
+                if prevReadLook then local uDot = math.clamp(userLook:Dot(prevReadLook),-1,1); local uDeg = math.deg(math.acos(uDot)); if uDeg > 0.05 then userDps = uDeg/dtSafe end end
+                if lastWriteLook then
+                        local wDot = math.clamp(userLook:Dot(lastWriteLook),-1,1); local wDeg = math.deg(math.acos(wDot)); local againstPull = false
+                        if prevReadLook then local pullAxis = prevReadLook:Cross(lastWriteLook); local handAxis = lastWriteLook:Cross(userLook); againstPull = pullAxis:Dot(handAxis) < 0 end
+                        if againstPull or wDeg/dtSafe < userDps then userDps = wDeg/dtSafe end
+                end
+                if userDps == math.huge then userDps = 0 end; prevReadLook = userLook; lastWriteLook = nil
+        end
+        local nowClock = os.clock()
+        if State.DragSwitch and userDps > (State.FlickSpeed or 90) then
+                if not flickArmStart then flickArmStart = nowClock end; if nowClock - flickArmStart >= FLICK_ARM then flickUntil = nowClock + FLICK_HOLD end
+        else flickArmStart = nil end
+        if aiming then
+                local zoomRaw = getZoomScale(camera)
+                if not zoomSmoothed then zoomSmoothed = zoomRaw else zoomSmoothed += (zoomRaw - zoomSmoothed)*(1 - math.exp(-deltaTime/ZOOM_TAU)) end
+        else zoomSmoothed = nil end
+        local vp = camera.ViewportSize; local screenCX, screenCY = vp.X*0.5, vp.Y*0.5; local scaledFOV = State.FOV*(vp.Y/1080)
+        if State.ShowFOV then
+                if FOVCircle.Position.X ~= screenCX or FOVCircle.Position.Y ~= screenCY then FOVCircle.Position = Vector2.new(screenCX, screenCY) end
+                if FOVCircle.Radius ~= scaledFOV then FOVCircle.Radius = scaledFOV end
+                if not FOVCircle.Visible then FOVCircle.Visible = true end
+        elseif FOVCircle.Visible then FOVCircle.Visible = false end
+        if not aiming then return end
+        if State.DragSwitch and nowClock < flickUntil then
+                if TargetService.CurrentTarget then switchAwayKey = TargetService.CurrentTarget; switchCooldownUntil = nowClock + SWITCH_COOLDOWN; TargetService:ReleaseTarget() end
+                steerInfluence = 1; steerHoldStart = nil; prevErrDeg = nil; return
+        end
+        if switchAwayKey and nowClock >= switchCooldownUntil then switchAwayKey = nil end
+        if TargetService.CurrentTarget then
+                if not isValidEnemy(TargetService.CurrentTarget) then TargetService:ReleaseTarget()
+                else
+                        local keep, offScreen = TargetService:KeepTarget(camera, screenCX, screenCY, scaledFOV)
+                        if keep then targetGraceUntil = 0
+                        else
+                                if targetGraceUntil == 0 and not offScreen then targetGraceUntil = nowClock + TARGET_GRACE end
+                                if offScreen or nowClock >= targetGraceUntil then TargetService:ReleaseTarget() end
+                        end
+                end
+        end
+        if not TargetService.CurrentTarget and nowClock - lastAcquireAt >= ACQUIRE_INTERVAL then lastAcquireAt = nowClock; TargetService:AcquireTarget(camera, screenCX, screenCY, scaledFOV) end
+        if State.SwitchAssist and TargetService.CurrentTarget then TargetService:CheckSwitch(camera, screenCX, screenCY, scaledFOV) end
+        local targetPart = TargetService.TargetPart
+        if TargetService.CurrentTarget and targetPart and targetPart.Parent then
+                local shooterPos = camera.CFrame.Position; local zoomScale = zoomSmoothed
+                local baseRate = (10 + State.Smoothness*30)*zoomScale; local leadTau = State.LagComp and math.min(1/baseRate,0.15) or 0
+                local targetPos = getPredictedPosition(targetPart, shooterPos, deltaTime, leadTau, zoomScale)
+                local desiredDirection = safeUnit(targetPos - shooterPos)
+                if desiredDirection then
+                        local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection),-1,1); local errDeg = math.deg(math.acos(dot))
+                        local errScaled = errDeg*zoomScale; local gain = State.TrackBoost or 1.5; local effSpeed = math.min(baseRate + errScaled*gain, 70)
+                        local sdt = math.min(deltaTime, 1/30); local alpha = 1 - math.exp(-effSpeed*sdt)
+                        local maxStepDps = (120 + State.Smoothness*240)*zoomScale; alpha = math.min(alpha, (maxStepDps*sdt)/math.max(errDeg,0.05))
+                        local steering = State.FreeSteer and userDps > STEER_DPS and prevErrDeg ~= nil and errDeg > prevErrDeg + 0.05
+                        if steering then
+                                if not steerHoldStart then steerHoldStart = nowClock end
+                                if State.DragSwitch and nowClock - steerHoldStart >= STEER_HOLD then
+                                        switchAwayKey = TargetService.CurrentTarget; switchCooldownUntil = nowClock + SWITCH_COOLDOWN
+                                        TargetService:ReleaseTarget(); flickUntil = nowClock + FLICK_HOLD; return
+                                end
+                        else steerHoldStart = nil end
+                        local infTarget = steering and STEER_MIN_INFLUENCE or 1; steerInfluence += (infTarget - steerInfluence)*(1 - math.exp(-deltaTime/STEER_TAU))
+                        alpha = math.clamp(alpha,0,1); steerInfluence = math.clamp(steerInfluence,0,1)
+                        local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha*steerInfluence))
+                        if smoothDirection then
+                                local ok, newCFrame = pcall(CFrame.lookAt, shooterPos, shooterPos + smoothDirection)
+                                if ok and newCFrame then camera.CFrame = newCFrame; lastWriteLook = smoothDirection end
+                        end
+                        prevErrDeg = errDeg
+                else prevErrDeg = nil end
+        end
+end
+
+local function connectRenderLoop()
+        CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(deltaTime)
+                lastRenderTick = os.clock()
+                local ok, err = xpcall(renderTick, traceFn, deltaTime)
+                if ok then renderErrStreak = 0
+                else
+                        renderErrStreak += 1
+                        if renderErrStreak == 10 then warn("[GLX v3.14] aim loop error: "..tostring(err)); if setStickyStatus then setStickyStatus("aim error: "..tostring(err):sub(1,40)) end end
+                end
+        end))
+end
+connectRenderLoop()
+
+-- ==========================================
+-- 11. LOAD REPORT + WATCHDOG + FPS METER
+-- ==========================================
+setGlxStatus(M5)
+
+local stickyMsg, stickyUntil = nil, 0
+setStickyStatus = function(msg)
+        stickyMsg = tostring(msg); stickyUntil = os.clock() + 6
+        warn("[GLX v3.14] "..stickyMsg); if StatusLabel then StatusLabel.Text = stickyMsg end
+end
+
+do
+        local watchdogAccum = 0
+        local M6_local = T{79,88,78,88,84,89,81,88,122,97,162,251,219,165,254,128,216,128,179,219,132,164,30,94,41,44,98,47,43,42,54,23,216,129,187,219,132,152,222,135,241,161,250,217,164,253,231,215,128,139,218,130,189,221,134,154,160,248,203,163,252,226}
+        local M7_local = T{79,88,78,88,84,89,81,88,122,97,162,251,219,165,254,128,216,128,179,219,132,164,30,122,19,17,98,47,43,42,54,23,216,129,187,219,132,152,222,135,241,161,250,217,164,253,231,215,128,139,218,130,189,221,134,154,160,248,203,163,252,226}
+        CleanupManager:AddConn("Watchdog", RunService.Heartbeat:Connect(function(dt)
+                watchdogAccum += dt; if watchdogAccum < 1 then return end; watchdogAccum = 0; local now = os.clock()
+                if State.Aimbot and now - lastRenderTick > 2 then
+                        local oldConn = CleanupManager.Connections.RenderStep
+                        if not (oldConn and oldConn.Connected) then lastRenderTick = now; connectRenderLoop(); setStickyStatus(M6_local) end
+                end
+                if (State.ESP or State.ESPName) and now - lastEspTick > 2 then
+                        local oldEspConn = CleanupManager.Connections.ESP_Heartbeat
+                        if not (oldEspConn and oldEspConn.Connected) then lastEspTick = now; connectESP(); setStickyStatus(M7_local) end
+                end
+        end))
+end
+
+do
+        local fpsFrames, fpsAccum = 0, 0
+        CleanupManager:AddConn("FPSMeter", RunService.Heartbeat:Connect(function(dt)
+                fpsFrames += 1; fpsAccum += dt
+                if fpsAccum >= 1 then
+                        local fps = math.floor(fpsFrames/fpsAccum + 0.5); fpsFrames, fpsAccum = 0, 0
+                        if StatusLabel then
+                                local text = (stickyMsg and os.clock() < stickyUntil) and stickyMsg or ("FPS "..fps)
+                                if text ~= lastStatusText or statusDirty then lastStatusText = text; statusDirty = false; if MainFrame.Visible then StatusLabel.Text = text end end
+                        end
+                end
+        end))
+end
+
+print("[GLX v3.14-FIX] PART 5/5 loaded — ALL SYSTEMS READY ✅")
+
+  
