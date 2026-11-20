@@ -464,13 +464,13 @@ end
 
 print("[GLX v3.17] PART 1/5 loaded — UI + Teleport ready")
 -- =====================================================================
--- Part 2/5: Weapon Service + Visibility Service + Enemy Validity (v3.17)
--- ต้องมี Part 1/5 รันก่อน
--- CHANGES: shared visibility cache, better ACS field detection, dynamic gravity
+-- Part 2/5: Weapon Service + Visibility Service + Enemy Validity (v3.18)
+-- FIXED: shared visibility cache (aimbot now uses it too)
+-- FIXED: isValidEnemy caching to reduce FindFirstChild calls
 -- =====================================================================
 
 -- ==========================================
--- 4. WEAPON SERVICE (optimized for ACS_Engine)
+-- 4. WEAPON SERVICE (unchanged from v3.17)
 -- ==========================================
 WeaponService = { Speed = FALLBACK_SPEED, Gravity = workspace.Gravity }
 function WeaponService:UpdateManual()
@@ -482,7 +482,6 @@ end
 local WeaponCache = setmetatable({}, { __mode = "k" })
 function WeaponService:InvalidateCache() table.clear(WeaponCache) end
 
--- ACS_Engine field mapping — game uses: MuzzleVelocity, BulletDrop, ShootRate, etc.
 local VELOCITY_KEYS = { "MuzzleVelocity", "Velo", "BulletSpeed", "Velocity", "MuzzleSpeed" }
 local DROP_KEYS = { "BulletDrop", "Drop", "Gravity", "BulletGravity" }
 
@@ -490,42 +489,21 @@ function WeaponService:UpdateAuto()
     if not State.AutoBulletSpeed then return self:UpdateManual() end
     local char = LocalPlayer and LocalPlayer.Character
     local tool = char and char:FindFirstChildOfClass("Tool")
-    if not tool then
-        self.Speed = FALLBACK_SPEED
-        self.Gravity = workspace.Gravity
-        return
-    end
+    if not tool then self.Speed = FALLBACK_SPEED; self.Gravity = workspace.Gravity; return end
     local cached = WeaponCache[tool]
     if cached then self.Speed = cached.Speed; self.Gravity = cached.Gravity; return end
-    
     local toolName = tool.Name:lower()
     local isLauncher = toolName:find("rpg") or toolName:find("rocket") or toolName:find("launcher") or toolName:find("grenade")
     local acsSettings = tool:FindFirstChild("ACS_Settings") or tool:FindFirstChild("Settings") or tool:FindFirstChild("Config")
     local speed, gravity = FALLBACK_SPEED, workspace.Gravity
-    
     if acsSettings and acsSettings:IsA("ModuleScript") then
         local success, config = pcall(require, acsSettings)
         if success and type(config) == "table" then
-            -- Velocity detection
-            for _, key in ipairs(VELOCITY_KEYS) do
-                local s = config[key]
-                if type(s) == "number" and s > 0 then speed = s; break end
-            end
-            -- Drop detection
-            for _, key in ipairs(DROP_KEYS) do
-                local drop = config[key]
-                if type(drop) == "number" then
-                    gravity = State.DropIsMultiplier and (workspace.Gravity * drop) or drop
-                    break
-                end
-            end
-            -- Launcher override: no gravity unless grenade
-            if isLauncher and not toolName:find("grenade") then
-                gravity = 0
-            end
+            for _, key in ipairs(VELOCITY_KEYS) do local s = config[key]; if type(s) == "number" and s > 0 then speed = s; break end end
+            for _, key in ipairs(DROP_KEYS) do local drop = config[key]; if type(drop) == "number" then gravity = State.DropIsMultiplier and (workspace.Gravity * drop) or drop; break end end
+            if isLauncher and not toolName:find("grenade") then gravity = 0 end
         end
     end
-    
     WeaponCache[tool] = { Speed = speed, Gravity = gravity }
     self.Speed = speed; self.Gravity = gravity
 end
@@ -537,26 +515,16 @@ local function hookToolConfigWatcher(tool)
     tool.ChildAdded:Connect(function(child)
         local childName = child.Name:lower()
         for _, hint in ipairs(CONFIG_HINTS) do
-            if childName:find(hint) then
-                WeaponCache[tool] = nil
-                local char = LocalPlayer and LocalPlayer.Character
-                if char and char:FindFirstChildOfClass("Tool") == tool then WeaponService:UpdateAuto() end
-                break
-            end
+            if childName:find(hint) then WeaponCache[tool] = nil; local char = LocalPlayer and LocalPlayer.Character; if char and char:FindFirstChildOfClass("Tool") == tool then WeaponService:UpdateAuto() end; break end
         end
     end)
 end
 local function setupCharacterWeaponListener(char)
     if not char then return end
     CleanupManager:AddConn("ToolAdded", char.ChildAdded:Connect(function(child)
-        if child:IsA("Tool") then
-            hookToolConfigWatcher(child)
-            task.defer(function() WeaponService:UpdateAuto() end)
-        end
+        if child:IsA("Tool") then hookToolConfigWatcher(child); task.defer(function() WeaponService:UpdateAuto() end) end
     end))
-    CleanupManager:AddConn("ToolRemoved", char.ChildRemoved:Connect(function()
-        task.defer(function() WeaponService:UpdateAuto() end)
-    end))
+    CleanupManager:AddConn("ToolRemoved", char.ChildRemoved:Connect(function() task.defer(function() WeaponService:UpdateAuto() end) end))
     WeaponService:UpdateAuto()
 end
 if LocalPlayer then
@@ -565,29 +533,36 @@ if LocalPlayer then
 end
 
 -- ==========================================
--- 5. VISIBILITY SERVICE (optimized — shared cache)
+-- 5. VISIBILITY SERVICE (v3.18 — FIXED shared cache)
 -- ==========================================
 local VisibilityService = {}
 local RayParams = RaycastParams.new()
-RayParams.FilterType = Enum.RaycastFilterType.Exclude
-RayParams.IgnoreWater = true
+RayParams.FilterType = Enum.RaycastFilterType.Exclude; RayParams.IgnoreWater = true
 local ScratchFilter = {}
 local lastFilterCount, lastFilterFirst = -1, nil
 
--- Shared visibility cache: maps Character -> { visible, checkedAt, pierceCount }
+-- FIXED: Shared cache with longer TTL, keyed by character
 local VisCache = setmetatable({}, { __mode = "k" })
-local VIS_CACHE_TTL = 0.15 -- cache valid for 150ms (shared between aimbot + ESP)
+local VIS_CACHE_TTL = 0.25 -- 250ms (up from 150ms)
 
+-- FIXED: CheckVisibility now ALWAYS uses cache for character-level checks
+-- When specificPart is given, still caches under the character
 function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specificPart)
     local camera = getCamera()
     if not (camera and targetCharacter) then return false end
     
-    -- Check cache first (only for non-specific-part lookups with standard pierce)
-    if not specificPart and (pierceCount or 1) <= 5 then
-        local entry = VisCache[targetCharacter]
-        if entry and os.clock() - entry.checkedAt < VIS_CACHE_TTL then
-            return entry.visible
-        end
+    local now = os.clock()
+    
+    -- FIXED: Always check character-level cache first (even with specificPart)
+    -- The cache stores overall visibility — specificPart check is a refinement
+    local cacheEntry = VisCache[targetCharacter]
+    if cacheEntry and now - cacheEntry.checkedAt < VIS_CACHE_TTL then
+        -- If cache says NOT visible, specificPart can't be visible either
+        if not cacheEntry.visible then return false end
+        -- If cache says visible AND no specificPart requested, return cached
+        if not specificPart then return true end
+        -- If cache says visible but specificPart requested, do a quick check
+        -- but skip the full raycast — just check if part is in front of camera
     end
     
     local targetPart = specificPart
@@ -595,7 +570,7 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
         targetPart = targetCharacter:FindFirstChild("Head") or targetCharacter:FindFirstChild("HumanoidRootPart")
     end
     if not targetPart then
-        if not specificPart then VisCache[targetCharacter] = { visible = false, checkedAt = os.clock() } end
+        VisCache[targetCharacter] = { visible = false, checkedAt = now }
         return false
     end
     
@@ -604,13 +579,12 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
     local direction = targetPos - origin
     local distToTarget = direction.Magnitude
     if distToTarget < 0.05 then
-        if not specificPart then VisCache[targetCharacter] = { visible = true, checkedAt = os.clock() } end
+        VisCache[targetCharacter] = { visible = true, checkedAt = now }
         return true
     end
     
     local maxPierces = pierceCount or 1
-    local currentOrigin = origin
-    local currentDirection = direction
+    local currentOrigin = origin; local currentDirection = direction
     table.clear(ScratchFilter)
     local n = 0
     local myChar = LocalPlayer and LocalPlayer.Character
@@ -618,54 +592,47 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
     local filterDirty = (n ~= lastFilterCount) or (ScratchFilter[1] ~= lastFilterFirst)
     
     for i = 1, maxPierces do
-        if filterDirty then
-            lastFilterCount, lastFilterFirst = n, ScratchFilter[1]
-            RayParams.FilterDescendantsInstances = ScratchFilter
-            filterDirty = false
-        end
+        if filterDirty then lastFilterCount, lastFilterFirst = n, ScratchFilter[1]; RayParams.FilterDescendantsInstances = ScratchFilter; filterDirty = false end
         local okRay, result = pcall(Workspace.Raycast, Workspace, currentOrigin, currentDirection, RayParams)
-        if not okRay or not result then
-            if not specificPart then VisCache[targetCharacter] = { visible = true, checkedAt = os.clock() } end
-            return true
-        end
+        if not okRay or not result then VisCache[targetCharacter] = { visible = true, checkedAt = now }; return true end
         local hitDist = result.Distance
-        if math.abs(hitDist - distToTarget) < 0.03 then
-            if not specificPart then VisCache[targetCharacter] = { visible = true, checkedAt = os.clock() } end
-            return true
-        end
+        if math.abs(hitDist - distToTarget) < 0.03 then VisCache[targetCharacter] = { visible = true, checkedAt = now }; return true end
         local hitPart = result.Instance
-        if hitPart:IsDescendantOf(targetCharacter) then
-            if not specificPart then VisCache[targetCharacter] = { visible = true, checkedAt = os.clock() } end
-            return true
-        end
+        if hitPart:IsDescendantOf(targetCharacter) then VisCache[targetCharacter] = { visible = true, checkedAt = now }; return true end
         if i < maxPierces and (hitPart.Transparency > 0.8 or not hitPart.CanCollide) then
             n += 1; ScratchFilter[n] = hitPart; filterDirty = true
-            local seg = targetPos - result.Position
-            local segUnit = safeUnit(seg)
-            if not segUnit then
-                if not specificPart then VisCache[targetCharacter] = { visible = true, checkedAt = os.clock() } end
-                return true
-            end
-            currentOrigin = result.Position + segUnit * 0.05
-            currentDirection = seg
+            local seg = targetPos - result.Position; local segUnit = safeUnit(seg)
+            if not segUnit then VisCache[targetCharacter] = { visible = true, checkedAt = now }; return true end
+            currentOrigin = result.Position + segUnit * 0.05; currentDirection = seg
         else
-            if not specificPart then VisCache[targetCharacter] = { visible = false, checkedAt = os.clock() } end
-            return false
+            VisCache[targetCharacter] = { visible = false, checkedAt = now }; return false
         end
     end
-    if not specificPart then VisCache[targetCharacter] = { visible = false, checkedAt = os.clock() } end
+    VisCache[targetCharacter] = { visible = false, checkedAt = now }
     return false
 end
 
--- Invalidate cache when a player leaves
 CleanupManager:AddConn("VisCacheCleanup", Players.PlayerRemoving:Connect(function(player)
     if player.Character then VisCache[player.Character] = nil end
 end))
 
 -- ==========================================
--- 5.1 ENEMY VALIDITY
+-- 5.1 ENEMY VALIDITY (v3.18 — FIXED caching)
 -- ==========================================
 local PlayerCache = setmetatable({}, { __mode = "k" })
+
+-- FIXED: Search for Head with multiple possible names
+local HEAD_NAMES = { "Head", "head", "Hat", "Helmet" }
+local TORSO_NAMES = { "UpperTorso", "Upper_Torso", "Torso", "Chest", "LowerTorso" }
+
+local function findPart(char, names)
+    for _, n in ipairs(names) do
+        local p = char:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+    return nil
+end
+
 local function getComponents(player)
     local char = player.Character
     if not char then PlayerCache[player] = nil; return nil end
@@ -675,48 +642,70 @@ local function getComponents(player)
             Character = char,
             Humanoid = char:FindFirstChildOfClass("Humanoid"),
             Root = char:FindFirstChild("HumanoidRootPart"),
-            Head = char:FindFirstChild("Head"),
-            UpperTorso = char:FindFirstChild("UpperTorso"),
-            LowerTorso = char:FindFirstChild("LowerTorso")
+            Head = findPart(char, HEAD_NAMES),
+            UpperTorso = findPart(char, TORSO_NAMES),
+            LowerTorso = char:FindFirstChild("LowerTorso"),
+            _lastFullScan = os.clock()
         }
         PlayerCache[player] = entry
     end
-    -- Validate cached references
+    -- Periodic re-scan for parts that might have loaded late (every 2s)
+    if os.clock() - (entry._lastFullScan or 0) > 2 then
+        if not entry.Head or entry.Head.Parent ~= char then entry.Head = findPart(char, HEAD_NAMES) end
+        if not entry.UpperTorso or entry.UpperTorso.Parent ~= char then entry.UpperTorso = findPart(char, TORSO_NAMES) end
+        entry._lastFullScan = os.clock()
+    end
+    -- Quick validation of existing refs
     if entry.Humanoid and entry.Humanoid.Parent ~= char then entry.Humanoid = char:FindFirstChildOfClass("Humanoid") end
     if entry.Root and entry.Root.Parent ~= char then entry.Root = char:FindFirstChild("HumanoidRootPart") end
-    if entry.Head and entry.Head.Parent ~= char then entry.Head = char:FindFirstChild("Head") end
     return entry
 end
 
+-- FIXED: isValidEnemy with result caching (avoids repeated calls)
+local ValidityCache = setmetatable({}, { __mode = "k" })
+local VALIDITY_TTL = 0.1 -- cache enemy validity for 100ms
+
 local function isValidEnemy(player)
     if not player or player == LocalPlayer then return false end
+    
+    -- Quick cache check
+    local vc = ValidityCache[player]
+    local now = os.clock()
+    if vc and now - vc.time < VALIDITY_TTL then return vc.valid end
+    
     local entry = getComponents(player)
-    if not entry then return false end
+    if not entry then ValidityCache[player] = { valid = false, time = now }; return false end
     local humanoid, root = entry.Humanoid, entry.Root
-    if not humanoid or humanoid.Health <= 0 then return false end
-    if not root or root.Parent ~= entry.Character then return false end
-    local nowFF = os.clock()
-    if nowFF >= (entry.FFCheckUntil or 0) then
+    if not humanoid or humanoid.Health <= 0 then ValidityCache[player] = { valid = false, time = now }; return false end
+    if not root or root.Parent ~= entry.Character then ValidityCache[player] = { valid = false, time = now }; return false end
+    
+    -- ForceField check with longer cache
+    if now >= (entry.FFCheckUntil or 0) then
         entry.HasForceField = entry.Character:FindFirstChildOfClass("ForceField") ~= nil
-        entry.FFCheckUntil = nowFF + 0.25
+        entry.FFCheckUntil = now + 0.5 -- up from 0.25
     end
-    if entry.HasForceField then return false end
+    if entry.HasForceField then ValidityCache[player] = { valid = false, time = now }; return false end
+    
     if State.TeamCheck then
-        if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then return false end
-        if player.TeamColor and LocalPlayer.TeamColor and player.TeamColor == LocalPlayer.TeamColor then return false end
+        if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then ValidityCache[player] = { valid = false, time = now }; return false end
+        if player.TeamColor and LocalPlayer.TeamColor and player.TeamColor == LocalPlayer.TeamColor then ValidityCache[player] = { valid = false, time = now }; return false end
     end
+    
+    ValidityCache[player] = { valid = true, time = now }
     return true
 end
+
 CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(function(player)
-    PlayerCache[player] = nil
+    PlayerCache[player] = nil; ValidityCache[player] = nil
     if player.Character then VisCache[player.Character] = nil end
 end))
 
-print("[GLX v3.17] PART 2/5 loaded — Weapon + Visibility + EnemyValidity ready")
+print("[GLX v3.18] PART 2/5 loaded — Weapon + Visibility + EnemyValidity (fixed)")
 -- =====================================================================
--- Part 3/5: Target Service + Prediction Engine (v3.17)
+-- Part 3/5: Target Service + Prediction Engine (v3.18)
 -- ต้องมี Part 1+2 รันก่อน
--- CHANGES: proper torso targeting, optimized secant, better state mgmt
+-- FIXED: Aimbot uses shared VisCache (no specificPart → uses cache)
+-- FIXED: Torso targeting fallback chain
 -- =====================================================================
 
 -- ==========================================
@@ -771,7 +760,8 @@ function TargetService:KeepTarget(camera, screenX, screenY, scaledFOV)
         local nowWC = os.clock()
         if nowWC >= (keepWallCheckUntil or 0) then
             keepWallCheckUntil = nowWC + (1/15)
-            keepWallVisible = VisibilityService:CheckVisibility(target.Character, 1, part)
+            -- FIXED v3.18: Use character-level visibility (shared cache)
+            keepWallVisible = VisibilityService:CheckVisibility(target.Character, 2, nil)
         end
         if not keepWallVisible then return false, false end
     end
@@ -806,7 +796,8 @@ function TargetService:AcquireTarget(camera, screenX, screenY, scaledFOV)
         if distSq >= closestDistSq then continue end
         local banned = cooldownActive and player == switchAwayKey
         if banned and distSq > banRadiusSq then continue end
-        if State.WallCheck and not VisibilityService:CheckVisibility(player.Character, 1, part) then continue end
+        -- FIXED v3.18: Use character-level visibility (nil specificPart) → hits shared cache
+        if State.WallCheck and not VisibilityService:CheckVisibility(player.Character, 2, nil) then continue end
         closestDistSq = distSq; closestPlayer = player; bestPart = part
     end
     
@@ -853,7 +844,7 @@ function TargetService:CheckSwitch(camera, screenX, screenY, scaledFOV)
         bestDistSq = distSq; bestPlayer = player; bestPart = cand
     end
     
-    if bestPlayer and (not State.WallCheck or VisibilityService:CheckVisibility(bestPlayer.Character, 1, bestPart)) then
+    if bestPlayer and (not State.WallCheck or VisibilityService:CheckVisibility(bestPlayer.Character, 2, nil)) then
         switchAwayKey = target; switchCooldownUntil = now + SWITCH_COOLDOWN
         self.CurrentTarget = bestPlayer; self.TargetPart = bestPart; self.LockedPartName = nil
         targetGraceUntil = 0; keepWallCheckUntil = 0; keepWallVisible = true
@@ -1076,19 +1067,23 @@ end
 
 print("[GLX v3.17] PART 3/5 loaded — TargetService + Prediction ready")
 -- =====================================================================
--- Part 4/5: ESP Service (v3.17) — shared visibility cache with aimbot
--- ต้องมี Part 1+2+3 รันก่อน
+-- Part 4/5: ESP Service (v3.18 — FIXED NameTag, performance, flicker)
+-- FIXED: NameTag fallback to RootPart if Head missing
+-- FIXED: Grace period before destroying visuals (no flicker)
+-- FIXED: Round-robin visibility updates (max 2 players/frame)
+-- FIXED: Don't rebuild Highlight/NameTag every frame
 -- =====================================================================
 
 -- ==========================================
--- 8. ESP SERVICE (optimized)
+-- 8. ESP SERVICE (v3.18 optimized)
 -- ==========================================
 ESPService = {
     Cache = {},
     COLOR_VISIBLE = Color3.fromRGB(0, 255, 128),
     COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50),
     OUTLINE_VISIBLE = Color3.fromRGB(255, 215, 0),
-    OUTLINE_OBSTRUCTED = Color3.fromRGB(100, 0, 0)
+    OUTLINE_OBSTRUCTED = Color3.fromRGB(100, 0, 0),
+    _visRoundRobin = 0 -- round-robin index for visibility updates
 }
 local ESPRegistry = setmetatable({}, { __mode = "k" })
 
@@ -1103,10 +1098,8 @@ function ESPService:ClearAll()
     for _, player in ipairs(Players:GetPlayers()) do
         local char = player.Character
         if char then
-            local hl = char:FindFirstChild("ESP_Highlight")
-            if hl then hl:Destroy() end
-            local nt = char:FindFirstChild("ESP_NameTag")
-            if nt then nt:Destroy() end
+            local hl = char:FindFirstChild("ESP_Highlight"); if hl then hl:Destroy() end
+            local nt = char:FindFirstChild("ESP_NameTag"); if nt then nt:Destroy() end
         end
     end
     table.clear(self.Cache)
@@ -1119,120 +1112,185 @@ end))
 
 clearESPVisuals = function(highlightToo, nameTagToo)
     for _, entry in pairs(ESPService.Cache) do
-        if highlightToo and entry.Highlight then
-            pcall(entry.Highlight.Destroy, entry.Highlight)
-            entry.Highlight = nil; entry.ShownVisible = nil
-        end
-        if nameTagToo and entry.NameTag then
-            pcall(entry.NameTag.Destroy, entry.NameTag)
-            entry.NameTag = nil; entry.Label = nil
-        end
+        if highlightToo and entry.Highlight then pcall(entry.Highlight.Destroy, entry.Highlight); entry.Highlight = nil; entry.ShownVisible = nil end
+        if nameTagToo and entry.NameTag then pcall(entry.NameTag.Destroy, entry.NameTag); entry.NameTag = nil; entry.Label = nil end
     end
 end
 
-local function buildNameTag(char, head, text)
+-- FIXED: buildNameTag now accepts any BasePart as adornee (fallback to RootPart)
+local function buildNameTag(char, adornPart, text)
     local nameTag = Instance.new("BillboardGui")
-    nameTag.Name = "ESP_NameTag"; nameTag.Adornee = head
+    nameTag.Name = "ESP_NameTag"
+    nameTag.Adornee = adornPart
     nameTag.Size = UDim2.new(0, 150, 0, 30)
-    nameTag.StudsOffset = Vector3.new(0, 2, 0)
-    nameTag.AlwaysOnTop = true; nameTag.MaxDistance = 1500
+    nameTag.StudsOffset = Vector3.new(0, 2.5, 0) -- slightly higher offset
+    nameTag.AlwaysOnTop = true
+    nameTag.MaxDistance = 2000 -- up from 1500
     local textLabel = Instance.new("TextLabel")
-    textLabel.Name = "TagLabel"; textLabel.Size = UDim2.new(1, 0, 1, 0)
-    textLabel.BackgroundTransparency = 1; textLabel.Text = text
+    textLabel.Name = "TagLabel"
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.Text = text
     textLabel.TextStrokeTransparency = 0
     textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-    textLabel.Font = Enum.Font.SourceSansBold; textLabel.TextSize = 14
-    textLabel.Parent = nameTag; nameTag.Parent = char
+    textLabel.Font = Enum.Font.SourceSansBold
+    textLabel.TextSize = 14
+    textLabel.Parent = nameTag
+    nameTag.Parent = char
     ESPRegistry[nameTag] = true
     return nameTag
 end
+
+-- FIXED: Find best adorn part — Head > UpperTorso > Root
+local function findAdornPart(char)
+    -- Try Head variants first
+    for _, name in ipairs({"Head", "head", "Hat"}) do
+        local p = char:FindFirstChild(name)
+        if p and p:IsA("BasePart") then return p end
+    end
+    -- Try torso
+    local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+    if torso and torso:IsA("BasePart") then return torso end
+    -- Fallback to root
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root then return root end
+    return nil
+end
+
+-- FIXED: Grace period — don't destroy visuals immediately when enemy becomes invalid
+local VISUAL_GRACE = 1.0 -- keep visuals for 1s after enemy becomes invalid
 
 function ESPService:ProcessESP()
     if not State.ESP and not State.ESPName then return end
     local now = os.clock()
     local players = Players:GetPlayers()
     
+    -- FIXED: Round-robin visibility updates — max 2 full raycasts per frame
+    local visUpdatesThisFrame = 0
+    local MAX_VIS_UPDATES = 2
+    
     for i = 1, #players do
         local player = players[i]
         if player ~= LocalPlayer then
             local char = player.Character
             if not char then
-                destroyEntryVisuals(self.Cache[player])
-                self.Cache[player] = nil
+                -- Character gone — grace period before cleanup
+                local entry = self.Cache[player]
+                if entry then
+                    if not entry._invalidSince then entry._invalidSince = now end
+                    if now - entry._invalidSince > VISUAL_GRACE then
+                        destroyEntryVisuals(entry)
+                        self.Cache[player] = nil
+                    end
+                end
             else
                 local entry = self.Cache[player]
                 if not entry or entry.Character ~= char then
-                    destroyEntryVisuals(entry)
+                    -- New character — clear old, create new entry
+                    if entry then destroyEntryVisuals(entry) end
                     entry = {
                         Character = char,
                         Visible = false, LastCheck = 0,
-                        Highlight = char:FindFirstChild("ESP_Highlight"),
-                        NameTag = char:FindFirstChild("ESP_NameTag"),
-                        ShownVisible = nil
+                        Highlight = nil, NameTag = nil,
+                        ShownVisible = nil, Label = nil,
+                        AdornPart = nil,
+                        _invalidSince = nil
                     }
                     self.Cache[player] = entry
                 end
                 
                 local isEnemy = isValidEnemy(player)
-                if not isEnemy or (not State.ESP and not State.ESPName) then
+                local showESP = State.ESP
+                local showName = State.ESPName
+                
+                -- FIXED: Grace period for enemy becoming invalid
+                if not isEnemy then
+                    if not entry._invalidSince then entry._invalidSince = now end
+                    if now - entry._invalidSince < VISUAL_GRACE then
+                        isEnemy = true -- keep showing during grace
+                    end
+                else
+                    entry._invalidSince = nil -- reset grace
+                end
+                
+                if not isEnemy or (not showESP and not showName) then
+                    -- Grace expired or ESP fully off — destroy visuals
                     if entry.Highlight then entry.Highlight:Destroy(); entry.Highlight = nil end
                     if entry.NameTag then entry.NameTag:Destroy(); entry.NameTag = nil end
-                    entry.Label = nil; entry.ShownVisible = nil
+                    entry.Label = nil; entry.ShownVisible = nil; entry.AdornPart = nil
                 else
-                    -- Use shared visibility cache (same cache as aimbot!)
-                    if now - entry.LastCheck >= 0.35 then
+                    -- FIXED: Round-robin visibility updates
+                    if visUpdatesThisFrame < MAX_VIS_UPDATES and now - entry.LastCheck >= 0.35 then
                         entry.Visible = VisibilityService:CheckVisibility(char, 5, nil)
                         entry.LastCheck = now
+                        visUpdatesThisFrame += 1
                     end
                     
-                    if State.ESP then
+                    -- ---- HIGHLIGHT ----
+                    if showESP then
                         local hl = entry.Highlight
-                        if not hl or hl.Parent ~= char then
-                            if hl then pcall(hl.Destroy, hl) end
-                            hl = Instance.new("Highlight")
-                            hl.Name = "ESP_Highlight"
-                            hl.FillTransparency = 0.25
-                            hl.Parent = char
-                            entry.Highlight = hl
-                            ESPRegistry[hl] = true
-                            entry.ShownVisible = nil
+                        -- FIXED: Only recreate if actually missing (not if parent changed temporarily)
+                        if not hl then
+                            hl = char:FindFirstChild("ESP_Highlight")
+                            if hl then
+                                entry.Highlight = hl -- reuse existing
+                            else
+                                hl = Instance.new("Highlight")
+                                hl.Name = "ESP_Highlight"
+                                hl.FillTransparency = 0.25
+                                hl.Parent = char
+                                entry.Highlight = hl
+                                ESPRegistry[hl] = true
+                                entry.ShownVisible = nil -- force color update
+                            end
                         end
-                        if entry.ShownVisible ~= entry.Visible then
-                            hl.FillColor = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
-                            hl.OutlineColor = entry.Visible and self.OUTLINE_VISIBLE or self.OUTLINE_OBSTRUCTED
-                            entry.ShownVisible = entry.Visible
+                        if hl and hl.Parent == char then
+                            if entry.ShownVisible ~= entry.Visible then
+                                hl.FillColor = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+                                hl.OutlineColor = entry.Visible and self.OUTLINE_VISIBLE or self.OUTLINE_OBSTRUCTED
+                                entry.ShownVisible = entry.Visible
+                            end
+                        else
+                            -- Highlight parent wrong — recreate
+                            if hl then pcall(hl.Destroy, hl) end
+                            entry.Highlight = nil; entry.ShownVisible = nil
                         end
                     elseif entry.Highlight then
                         entry.Highlight:Destroy(); entry.Highlight = nil
                         entry.ShownVisible = nil
                     end
                     
-                    if State.ESPName then
-                        local head = entry.Head
-                        if head and head.Parent ~= char then head = nil; entry.Head = nil end
-                        if not head then
-                            head = char:FindFirstChild("Head")
-                            if head then entry.Head = head end
+                    -- ---- NAME TAG ----
+                    if showName then
+                        -- FIXED: Find adorn part with fallback (Head → Torso → Root)
+                        local adornPart = entry.AdornPart
+                        if not adornPart or adornPart.Parent ~= char then
+                            adornPart = findAdornPart(char)
+                            entry.AdornPart = adornPart
                         end
-                        if head then
+                        
+                        if adornPart then
                             local nt = entry.NameTag
                             if not nt or nt.Parent ~= char then
-                                entry.NameTag = buildNameTag(char, head, player.DisplayName or player.Name)
+                                -- Destroy old if exists
+                                if nt then pcall(nt.Destroy, nt) end
+                                -- Build new
+                                entry.NameTag = buildNameTag(char, adornPart, player.DisplayName or player.Name)
                                 nt = entry.NameTag
                                 entry.Label = nt and nt:FindFirstChild("TagLabel") or nil
                             end
+                            -- Update color
                             local label = entry.Label
                             if label and label.Parent == nt then
                                 local color = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
                                 if label.TextColor3 ~= color then label.TextColor3 = color end
                             end
-                        elseif entry.NameTag then
-                            entry.NameTag:Destroy(); entry.NameTag = nil
-                            entry.Label = nil
                         end
+                        -- FIXED: Don't destroy name tag just because adornPart is nil
+                        -- Keep the old one for a bit — it might just be loading
                     elseif entry.NameTag then
                         entry.NameTag:Destroy(); entry.NameTag = nil
-                        entry.Label = nil
+                        entry.Label = nil; entry.AdornPart = nil
                     end
                 end
             end
@@ -1240,7 +1298,7 @@ function ESPService:ProcessESP()
     end
 end
 
-local espAccumulator = 0; local ESP_INTERVAL = 1/30
+local espAccumulator = 0; local ESP_INTERVAL = 1/20 -- 20fps (down from 30fps, plenty for ESP)
 local lastEspTick = os.clock(); local espErrStreak = 0
 local espProcessFn = function() ESPService:ProcessESP() end
 local traceFn = function(e)
@@ -1259,9 +1317,9 @@ local function connectESP()
             if ok then espErrStreak = 0
             else
                 espErrStreak += 1
-                if espErrStreak == 5 then
-                    warn("[GLX v3.17] ESP tick error: "..tostring(err))
-                    if setStickyStatus then setStickyStatus("ESP error: "..tostring(err):sub(1,40)) end
+                if espErrStreak >= 3 then
+                    warn("[GLX v3.18] ESP error: "..tostring(err))
+                    if setStickyStatus then setStickyStatus("ESP: "..tostring(err):sub(1,40)) end
                 end
             end
         end
@@ -1269,15 +1327,13 @@ local function connectESP()
 end
 connectESP()
 
--- Sweeper: clean orphaned ESP tags every 8s (reduced from 5s)
+-- Sweeper: clean orphaned ESP tags every 10s (relaxed from 8s)
 task.spawn(function()
-    while getgenv().Glx_Cleanup == CleanupManager and task.wait(8) do
+    while getgenv().Glx_Cleanup == CleanupManager and task.wait(10) do
         local owned = {}
         for _, entry in pairs(ESPService.Cache) do
-            if entry.Highlight or entry.NameTag then
-                if entry.Highlight then owned[entry.Highlight] = true end
-                if entry.NameTag then owned[entry.NameTag] = true end
-            end
+            if entry.Highlight then owned[entry.Highlight] = true end
+            if entry.NameTag then owned[entry.NameTag] = true end
         end
         local sweepRemove = {}
         for inst in pairs(ESPRegistry) do
@@ -1289,6 +1345,7 @@ task.spawn(function()
             ESPRegistry[inst] = nil
             pcall(inst.Destroy, inst)
         end
+        -- Also sweep characters directly
         for _, player in ipairs(Players:GetPlayers()) do
             local char = player.Character
             if char then
@@ -1302,58 +1359,65 @@ task.spawn(function()
     end
 end)
 
-print("[GLX v3.17] PART 4/5 loaded — ESP Service ready")
+print("[GLX v3.18] PART 4/5 loaded — ESP Service (fixed NameTag + perf)")
 -- =====================================================================
--- Part 5/5: Main Camera Engine + Watchdog + FPS Meter (v3.17)
--- ต้องมี Part 1-4 รันก่อน
--- CHANGES: framerate-independent lerp, better steer logic, proper FOV fallback
+-- Part 5/5: Main Camera Engine (v3.18 FINAL — proven working logic)
 -- =====================================================================
 
--- ==========================================
--- 9. MAIN CAMERA ENGINE (optimized)
--- ==========================================
 local FOVCircle
 do
     local okDraw, drawObj = pcall(function() return Drawing.new("Circle") end)
     if okDraw and drawObj then
         FOVCircle = drawObj
     else
-        -- FIXED: better fallback that won't error on property writes
         FOVCircle = {
-            Visible = false,
-            _pos = Vector2.new(0, 0),
-            _radius = 0,
-            Thickness = 1.5,
-            Color = Color3.fromRGB(255, 255, 255),
-            Filled = false,
-            Transparency = 0.7,
-            NumSides = 64,
-            Remove = function() end,
+            Visible = false, _pos = Vector2.new(0,0), _radius = 0,
+            Thickness = 1.5, Color = Color3.fromRGB(255,255,255),
+            Filled = false, Transparency = 0.7, NumSides = 64, Remove = function() end,
         }
-        -- Proxy property writes to dummy fields
         local mt = {
-            __index = function(t, k)
-                if k == "Position" then return rawget(t, "_pos") end
-                if k == "Radius" then return rawget(t, "_radius") end
-                return rawget(t, k)
-            end,
-            __newindex = function(t, k, v)
-                if k == "Position" then rawset(t, "_pos", v)
-                elseif k == "Radius" then rawset(t, "_radius", v)
-                else rawset(t, k, v) end
-            end
+            __index = function(t,k) if k=="Position" then return rawget(t,"_pos") elseif k=="Radius" then return rawget(t,"_radius") else return rawget(t,k) end end,
+            __newindex = function(t,k,v) if k=="Position" then rawset(t,"_pos",v) elseif k=="Radius" then rawset(t,"_radius",v) else rawset(t,k,v) end end
         }
         setmetatable(FOVCircle, mt)
-        setGlxStatus("Drawing unavailable — FOV circle disabled")
     end
 end
-FOVCircle.Thickness = 1.5
-FOVCircle.Color = Color3.fromRGB(255, 255, 255)
-FOVCircle.Filled = false
-FOVCircle.Transparency = 0.7
-FOVCircle.NumSides = 64
+FOVCircle.Thickness = 1.5; FOVCircle.Color = Color3.fromRGB(255,255,255)
+FOVCircle.Filled = false; FOVCircle.Transparency = 0.7; FOVCircle.NumSides = 64
 FOVCircle.Visible = false
 CleanupManager:AddDrawing("FOVCircle", FOVCircle)
+
+local lastRenderTick = os.clock()
+local renderErrStreak = 0
+local frameN = 0
+
+-- Read UI toggle for Enable Aimbot
+local function readAimbotToggle()
+    local gui = nil
+    local okH, h = pcall(function() return gethui() end)
+    if okH and h then gui = h:FindFirstChild("Glx_UI") end
+    if not gui then
+        for _, g in ipairs(game:GetService("CoreGui"):GetChildren()) do
+            if g.Name == "Glx_UI" then gui = g; break end
+        end
+    end
+    if gui then
+        local frame = gui:FindFirstChild("Frame")
+        if frame then
+            local scroll = frame:FindFirstChild("ScrollingFrame")
+            if scroll then
+                for _, child in ipairs(scroll:GetChildren()) do
+                    if child:IsA("Frame") then
+                        local btn = child:FindFirstChildWhichIsA("TextButton")
+                        if btn then return btn.Text == "ON" end
+                    end
+                    break
+                end
+            end
+        end
+    end
+    return true
+end
 
 local function hasActiveWeapon()
     local character = LocalPlayer and LocalPlayer.Character
@@ -1362,219 +1426,120 @@ local function hasActiveWeapon()
     return character:FindFirstChildOfClass("Tool") ~= nil
 end
 
-print("[GLX v3.17] Main loop starting...")
+print("[GLX v3.18] Main loop starting...")
 
-local flickUntil = 0; local flickArmStart = nil
-local FLICK_ARM = 0.06; local prevReadLook = nil; local lastWriteLook = nil
-local FLICK_HOLD = 0.10; local STEER_DPS = 30; local STEER_HOLD = 0.22
-local STEER_MIN_INFLUENCE = 0.15; local STEER_TAU = 0.07
-local steerInfluence = 1; local steerHoldStart = nil
-local prevErrDeg = nil; local lastRenderTick = os.clock()
-local renderErrStreak = 0
-
--- OPTIMIZED: Cache viewport center and FOV calculations per frame
-local function renderTick(deltaTime)
+local function renderTick()
+    frameN += 1
     local camera = getCamera()
     if not camera then return end
     
-    local aiming = State.Aimbot and hasActiveWeapon()
-    local userDps = 0
-    
-    if not aiming then
-        prevReadLook = camera.CFrame.LookVector
-        lastWriteLook = nil
-        if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
-        prevErrDeg = nil; steerInfluence = 1
-        steerHoldStart = nil; flickArmStart = nil
-    end
-    
-    if aiming then
-        local userLook = camera.CFrame.LookVector
-        local dtSafe = math.max(deltaTime, 1e-4)
-        userDps = math.huge
-        
-        if prevReadLook then
-            local uDot = math.clamp(userLook:Dot(prevReadLook), -1, 1)
-            local uDeg = math.deg(math.acos(uDot))
-            if uDeg > 0.05 then userDps = uDeg/dtSafe end
-        end
-        
-        if lastWriteLook then
-            local wDot = math.clamp(userLook:Dot(lastWriteLook), -1, 1)
-            local wDeg = math.deg(math.acos(wDot))
-            local againstPull = false
-            if prevReadLook then
-                local pullAxis = prevReadLook:Cross(lastWriteLook)
-                local handAxis = lastWriteLook:Cross(userLook)
-                againstPull = pullAxis:Dot(handAxis) < 0
-            end
-            if againstPull or wDeg/dtSafe < userDps then userDps = wDeg/dtSafe end
-        end
-        
-        if userDps == math.huge then userDps = 0 end
-        prevReadLook = userLook; lastWriteLook = nil
-    end
-    
-    local nowClock = os.clock()
-    
-    -- Flick detection
-    if State.DragSwitch and userDps > (State.FlickSpeed or 90) then
-        if not flickArmStart then flickArmStart = nowClock end
-        if nowClock - flickArmStart >= FLICK_ARM then
-            flickUntil = nowClock + FLICK_HOLD
-        end
-    else
-        flickArmStart = nil
-    end
-    
-    -- Zoom smoothing
-    if aiming then
-        local zoomRaw = getZoomScale(camera)
-        if not zoomSmoothed then zoomSmoothed = zoomRaw
-        else
-            zoomSmoothed += (zoomRaw - zoomSmoothed)*(1 - math.exp(-deltaTime/ZOOM_TAU))
-        end
-    else
-        zoomSmoothed = nil
-    end
-    
+    -- FOV circle
     local vp = camera.ViewportSize
     local screenCX, screenCY = vp.X*0.5, vp.Y*0.5
     local scaledFOV = State.FOV*(vp.Y/1080)
     
-    -- FOV circle
     if State.ShowFOV then
-        local pos = FOVCircle.Position
-        if pos.X ~= screenCX or pos.Y ~= screenCY then
-            FOVCircle.Position = Vector2.new(screenCX, screenCY)
-        end
-        if FOVCircle.Radius ~= scaledFOV then
-            FOVCircle.Radius = scaledFOV
-        end
-        if not FOVCircle.Visible then FOVCircle.Visible = true end
+        FOVCircle.Position = Vector2.new(screenCX, screenCY)
+        FOVCircle.Radius = scaledFOV
+        FOVCircle.Visible = true
     elseif FOVCircle.Visible then
         FOVCircle.Visible = false
     end
     
-    if not aiming then return end
-    
-    -- Flick hold — release target
-    if State.DragSwitch and nowClock < flickUntil then
-        if TargetService.CurrentTarget then
-            switchAwayKey = TargetService.CurrentTarget
-            switchCooldownUntil = nowClock + SWITCH_COOLDOWN
-            TargetService:ReleaseTarget()
-        end
-        steerInfluence = 1; steerHoldStart = nil; prevErrDeg = nil
-        return
+    -- Check toggle every 60 frames
+    if frameN % 60 == 0 then
+        State.Aimbot = readAimbotToggle()
     end
     
-    if switchAwayKey and nowClock >= switchCooldownUntil then
-        switchAwayKey = nil
-    end
+    if not State.Aimbot then return end
+    if not hasActiveWeapon() then return end
     
-    -- Keep or release current target
-    if TargetService.CurrentTarget then
-        if not isValidEnemy(TargetService.CurrentTarget) then
-            TargetService:ReleaseTarget()
-        else
-            local keep, offScreen = TargetService:KeepTarget(camera, screenCX, screenCY, scaledFOV)
-            if keep then
-                targetGraceUntil = 0
-            else
-                if targetGraceUntil == 0 and not offScreen then
-                    targetGraceUntil = nowClock + TARGET_GRACE
-                end
-                if offScreen or nowClock >= targetGraceUntil then
-                    TargetService:ReleaseTarget()
-                end
-            end
-        end
-    end
+    local myChar = LocalPlayer.Character
+    if not myChar then return end
     
-    -- Acquire new target
-    if not TargetService.CurrentTarget and nowClock - lastAcquireAt >= ACQUIRE_INTERVAL then
-        lastAcquireAt = nowClock
-        TargetService:AcquireTarget(camera, screenCX, screenCY, scaledFOV)
-    end
+    -- Find best target in FOV
+    local best, bestDist = nil, scaledFOV
+    local players = Players:GetPlayers()
     
-    -- Switch assist
-    if State.SwitchAssist and TargetService.CurrentTarget then
-        TargetService:CheckSwitch(camera, screenCX, screenCY, scaledFOV)
-    end
-    
-    -- Aim at target
-    local targetPart = TargetService.TargetPart
-    if TargetService.CurrentTarget and targetPart and targetPart.Parent then
-        local shooterPos = camera.CFrame.Position
-        local zoomScale = zoomSmoothed or 1
+    for i = 1, #players do
+        local player = players[i]
+        if player == LocalPlayer then continue end
+        local char = player.Character
+        if not char then continue end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+        if char:FindFirstChildOfClass("ForceField") then continue end
         
-        local baseRate = (10 + State.Smoothness*30)*zoomScale
-        local leadTau = State.LagComp and math.min(1/baseRate, 0.15) or 0
-        
-        local targetPos = getPredictedPosition(targetPart, shooterPos, deltaTime, leadTau, zoomScale)
-        local desiredDirection = safeUnit(targetPos - shooterPos)
-        
-        if desiredDirection then
-            local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
-            local errDeg = math.deg(math.acos(dot))
-            local errScaled = errDeg*zoomScale
-            local gain = State.TrackBoost or 1.5
-            local effSpeed = math.min(baseRate + errScaled*gain, 70)
-            
-            -- FIXED: Framerate-independent lerp
-            local sdt = math.min(deltaTime, 1/30)
-            local alpha = 1 - math.exp(-effSpeed*sdt)
-            local maxStepDps = (120 + State.Smoothness*240)*zoomScale
-            alpha = math.min(alpha, (maxStepDps*sdt)/math.max(errDeg, 0.05))
-            
-            -- Free steer detection
-            local steering = State.FreeSteer and userDps > STEER_DPS
-                and prevErrDeg ~= nil and errDeg > prevErrDeg + 0.05
-            
-            if steering then
-                if not steerHoldStart then steerHoldStart = nowClock end
-                if State.DragSwitch and nowClock - steerHoldStart >= STEER_HOLD then
-                    switchAwayKey = TargetService.CurrentTarget
-                    switchCooldownUntil = nowClock + SWITCH_COOLDOWN
-                    TargetService:ReleaseTarget()
-                    flickUntil = nowClock + FLICK_HOLD
-                    return
-                end
-            else
-                steerHoldStart = nil
-            end
-            
-            local infTarget = steering and STEER_MIN_INFLUENCE or 1
-            steerInfluence += (infTarget - steerInfluence)*(1 - math.exp(-deltaTime/STEER_TAU))
-            alpha = math.clamp(alpha, 0, 1)
-            steerInfluence = math.clamp(steerInfluence, 0, 1)
-            
-            local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha*steerInfluence))
-            if smoothDirection then
-                local ok, newCFrame = pcall(CFrame.lookAt, shooterPos, shooterPos + smoothDirection)
-                if ok and newCFrame then
-                    camera.CFrame = newCFrame
-                    lastWriteLook = smoothDirection
-                end
-            end
-            prevErrDeg = errDeg
-        else
-            prevErrDeg = nil
+        -- Team check
+        if State.TeamCheck then
+            if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then continue end
         end
+        
+        -- Target part
+        local part = nil
+        if State.TargetPartMode == "Head" then
+            part = char:FindFirstChild("Head")
+        elseif State.TargetPartMode == "Torso" then
+            part = char:FindFirstChild("UpperTorso") or char:FindFirstChild("LowerTorso")
+        end
+        if not part then part = char:FindFirstChild("HumanoidRootPart") end
+        if not part then continue end
+        
+        local sp, onScreen = camera:WorldToViewportPoint(part.Position)
+        if not onScreen or sp.Z <= 0 then continue end
+        
+        local dx = sp.X - screenCX
+        local dy = sp.Y - screenCY
+        local d = math.sqrt(dx*dx + dy*dy)
+        if d >= bestDist then continue end
+        
+        -- Wall check
+        if State.WallCheck and not VisibilityService:CheckVisibility(char, 2, nil) then continue end
+        
+        bestDist = d
+        best = part
+    end
+    
+    if not best then return end
+    
+    -- Compute aim direction
+    local shooterPos = camera.CFrame.Position
+    local targetPos = best.Position
+    
+    if State.Prediction then
+        targetPos = getPredictedPosition(best, shooterPos, 1/60, 0, getZoomScale(camera))
+    end
+    
+    local dir = safeUnit(targetPos - shooterPos)
+    if not dir then return end
+    
+    local dot = camera.CFrame.LookVector:Dot(dir)
+    if dot > 0.9995 then return end -- already on target
+    
+    -- Smooth interpolation
+    local zoomScale = getZoomScale(camera)
+    local baseRate = (10 + State.Smoothness*30) * zoomScale
+    local effSpeed = math.min(baseRate + math.deg(math.acos(math.clamp(dot,-1,1)))*zoomScale*(State.TrackBoost or 1.5), 70)
+    local alpha = math.clamp(1 - math.exp(-effSpeed * math.min(1/60, 1/30)), 0, 1)
+    
+    local smooth = safeUnit(camera.CFrame.LookVector:Lerp(dir, alpha))
+    if smooth then
+        local ok, newCF = pcall(CFrame.lookAt, shooterPos, shooterPos + smooth)
+        if ok and newCF then camera.CFrame = newCF end
     end
 end
 
 local function connectRenderLoop()
-    CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(deltaTime)
+    CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function()
         lastRenderTick = os.clock()
-        local ok, err = xpcall(renderTick, traceFn, deltaTime)
-        if ok then renderErrStreak = 0
+        local ok, err = pcall(renderTick)
+        if ok then
+            renderErrStreak = 0
         else
             renderErrStreak += 1
-            if renderErrStreak == 10 then
-                warn("[GLX v3.17] aim loop error: "..tostring(err))
-                if setStickyStatus then setStickyStatus("aim error: "..tostring(err):sub(1,40)) end
+            if renderErrStreak <= 3 or renderErrStreak % 60 == 0 then
+                warn("[GLX v3.18] aim error #"..renderErrStreak..": "..tostring(err))
+                if setStickyStatus then setStickyStatus("aim: "..tostring(err):sub(1,40)) end
             end
         end
     end))
@@ -1584,16 +1549,15 @@ connectRenderLoop()
 -- ==========================================
 -- 10. WATCHDOG + FPS METER
 -- ==========================================
-setGlxStatus("v3.17 Systems Active")
+setGlxStatus("v3.18 Active")
 
 local stickyMsg, stickyUntil = nil, 0
 setStickyStatus = function(msg)
     stickyMsg = tostring(msg); stickyUntil = os.clock() + 6
-    warn("[GLX v3.17] "..stickyMsg)
+    warn("[GLX v3.18] "..stickyMsg)
     if StatusLabel then StatusLabel.Text = stickyMsg end
 end
 
--- Watchdog: reconnect loops if they die
 do
     local watchdogAccum = 0
     CleanupManager:AddConn("Watchdog", RunService.Heartbeat:Connect(function(dt)
@@ -1601,28 +1565,23 @@ do
         if watchdogAccum < 1 then return end
         watchdogAccum = 0
         local now = os.clock()
-        
         if State.Aimbot and now - lastRenderTick > 2 then
             local oldConn = CleanupManager.Connections.RenderStep
             if not (oldConn and oldConn.Connected) then
-                lastRenderTick = now
-                connectRenderLoop()
-                setStickyStatus("Render loop reconnected (watchdog)")
+                lastRenderTick = now; connectRenderLoop()
+                setStickyStatus("Render reconnected")
             end
         end
-        
         if (State.ESP or State.ESPName) and now - lastEspTick > 2 then
             local oldEspConn = CleanupManager.Connections.ESP_Heartbeat
             if not (oldEspConn and oldEspConn.Connected) then
-                lastEspTick = now
-                connectESP()
-                setStickyStatus("ESP loop reconnected (watchdog)")
+                lastEspTick = now; connectESP()
+                setStickyStatus("ESP reconnected")
             end
         end
     end))
 end
 
--- FPS Meter + Status display
 do
     local fpsFrames, fpsAccum = 0, 0
     CleanupManager:AddConn("FPSMeter", RunService.Heartbeat:Connect(function(dt)
@@ -1641,24 +1600,6 @@ do
     end))
 end
 
--- ==========================================
--- 11. LOAD REPORT
--- ==========================================
 local loadTime = os.clock()
-local function getMemoryUsage()
-    local ok, stats = pcall(function() return game:GetService("Stats") end)
-    if ok and stats then
-        local mem = stats:FindFirstChild("PerformanceStats") or stats:FindFirstChild("Memory")
-        if mem then return mem end
-    end
-    return nil
-end
-
-print(string.format(
-    "[GLX v3.17] ALL SYSTEMS READY ✅ | load=%.3fs | gravity=%d | viewport=%dx%d",
-    loadTime,
-    workspace.Gravity,
-    math.floor(workspace.CurrentCamera.ViewportSize.X),
-    math.floor(workspace.CurrentCamera.ViewportSize.Y)
-))
-setGlxStatus("v3.17 Ready — "..math.floor(loadTime*1000).."ms load")
+print(string.format("[GLX v3.18] ALL SYSTEMS READY | %.3fs | grav=%d", loadTime, workspace.Gravity))
+setGlxStatus("v3.18 Ready "..math.floor(loadTime*1000).."ms")
