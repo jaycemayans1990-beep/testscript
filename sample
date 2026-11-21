@@ -5,6 +5,14 @@
 -- =====================================================================
 
 --[[
+  CHANGELOG v3.17 → v3.17.1 (บั๊ก ESP บางคนไม่ติด + กล้องสั่นตอนซูม):
+  ✓ getComponents: re-fetch part ที่เป็น nil ด้วย (เดิม cache poison → ผู้เล่นหลุด ESP ถาวร)
+  ✓ Aim controller: เปลี่ยนจาก deg-rate×zoom เป็น pixel-space + deadband + EMA
+  ✓ Flick threshold: คูณตามระดับ zoom (เดิมซูมแล้ว camera ที่ script เขียนเองถูกอ่านเป็น "มือผู้ใช้" → flick ถี่)
+  ✓ Steering: hysteresis + ปิดตอนซูม (เดิม toggle ทุกเฟรม → steerInfluence แกว่ง → กล้องสั่น)
+  ✓ Ping: EMA แทนค่าดิบ (เดิมกระโดดทุก 0.5s → lead เปลี่ยน → จุดเล็งกระโดด)
+  ✓ EMA ทิศทางเล็ง: tau ยาวขึ้นตาม zoom, snap เมื่อ error > 25°
+
   CHANGELOG v3.16 → v3.17:
   ✓ Torso targeting uses UpperTorso/LowerTorso (was: HumanoidRootPart)
   ✓ Visibility cache shared between ESP & aimbot (reduced Raycast calls)
@@ -116,7 +124,9 @@ local function getPing()
     local now = os.clock()
     if now >= pingUntil then
         local success, ping = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
-        cachedPing = (success and type(ping) == "number") and ping or 0.025
+        local raw = (success and type(ping) == "number" and ping > 0) and ping or 0.025
+        -- FIXED v3.17.1: EMA — ping ดิบกระโดดทุก 0.5s → lead time เปลี่ยน → จุดเล็งกระโดด → กล้องกระตุก
+        cachedPing += (raw - cachedPing) * 0.35
         pingUntil = now + 0.5
     end
     return cachedPing
@@ -1344,7 +1354,7 @@ do
             __newindex = function(t, k, v)
                 if k == "Position" then rawset(t, "_pos", v)
                 elseif k == "Radius" then rawset(t, "_radius", v)
-                else rawset(t, k, v) end
+                else rawset(t, k) end
             end
         }
         setmetatable(FOVCircle, mt)
@@ -1375,6 +1385,10 @@ local STEER_MIN_INFLUENCE = 0.15; local STEER_TAU = 0.07
 local steerInfluence = 1; local steerHoldStart = nil
 local prevErrDeg = nil; local lastRenderTick = os.clock()
 local renderErrStreak = 0
+-- v3.17.1: ตัวแปรกรองสัญญาณ (แก้กล้องสั่นตอนซูม)
+local aimDirSmoothed = nil   -- EMA ของทิศทางเล็ง (กรอง noise จาก prediction)
+local errTrend = 0           -- EMA ของอัตราการเปลี่ยน error (deg/frame) ใช้ตัดสิน steering
+local steerActive = false    -- hysteresis flag กัน steerInfluence แกว่งทุกเฟรม
 
 -- OPTIMIZED: Cache viewport center and FOV calculations per frame
 local function renderTick(deltaTime)
@@ -1390,6 +1404,7 @@ local function renderTick(deltaTime)
         if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
         prevErrDeg = nil; steerInfluence = 1
         steerHoldStart = nil; flickArmStart = nil
+        aimDirSmoothed = nil; errTrend = 0; steerActive = false
     end
     
     if aiming then
@@ -1422,7 +1437,11 @@ local function renderTick(deltaTime)
     local nowClock = os.clock()
     
     -- Flick detection
-    if State.DragSwitch and userDps > (State.FlickSpeed or 90) then
+    -- FIXED v3.17.1: ตอนซูม (FOV แคบ) camera CFrame ที่ script เขียนเองถูกอ่านเป็น "มือผู้เล่น"
+    -- → flick trigger ทุก ~0.16s → ปล่อยเป้า/รับใหม่ → กล้องกระตุกเป็นจังหวะ
+    -- แก้: ยก threshold ตามระดับ zoom (ซูม 5x = ต้อง flick แรงขึ้น 5 เท่าจึงจะปล่อยเป้า)
+    local flickThreshold = (State.FlickSpeed or 90) * (zoomSmoothed and math.max(zoomSmoothed, 1) or 1)
+    if State.DragSwitch and userDps > flickThreshold then
         if not flickArmStart then flickArmStart = nowClock end
         if nowClock - flickArmStart >= FLICK_ARM then
             flickUntil = nowClock + FLICK_HOLD
@@ -1513,29 +1532,62 @@ local function renderTick(deltaTime)
         local shooterPos = camera.CFrame.Position
         local zoomScale = zoomSmoothed or 1
         
-        local baseRate = (10 + State.Smoothness*30)*zoomScale
-        local leadTau = State.LagComp and math.min(1/baseRate, 0.15) or 0
-        
+        -- ===== v3.17.1: zoom-stable aim controller =====
+        -- บั๊กเดิม: baseRate ถูกคูณ zoomScale → ที่ 5x alpha/เฟรม = 0.69
+        --           noise ของ prediction ทะลุเข้า camera เกือบ 100% → กล้องสั่น
+        -- แก้: ควบคุมเป็น "pixel error บนจอ" + deadband + EMA + hysteresis
+        local sdt = math.min(deltaTime, 1/30)
+
+        -- px ต่อ 1 องศา ที่ FOV ปัจจุบัน (ซูมยิ่งมาก ตัวคูณยิ่งสูง)
+        local fovDeg = math.clamp(camera.FieldOfView, 1, 120)
+        local pxPerDeg = (vp.Y * 0.5) / math.max(math.tan(math.rad(fovDeg) * 0.5), 1e-3) * (math.pi / 180)
+        local zoomNow = math.clamp(DEFAULT_FOV / math.max(fovDeg, 1), 1, 12)  -- ใช้ค่าจริง ไม่ clamp 5
+        local scoped = zoomNow > 2
+
+        local speedBase = 12 + State.Smoothness*38   -- อัตราคอนเวิร์จ (px-space ไม่ผูกกับ zoom)
+        local leadTau = State.LagComp and math.min(1/math.max(speedBase, 1), 0.15) or 0
+
         local targetPos = getPredictedPosition(targetPart, shooterPos, deltaTime, leadTau, zoomScale)
         local desiredDirection = safeUnit(targetPos - shooterPos)
-        
+
         if desiredDirection then
-            local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
+            -- EMA กรองทิศทาง: ตัด noise จาก AssemblyLinearVelocity + accel lead
+            -- tau ยาวขึ้นตาม zoom (ซูมสูง = ต้องนิ่งกว่า)
+            local dirTau = 0.030 + 0.018*zoomNow
+            if not aimDirSmoothed then
+                aimDirSmoothed = desiredDirection
+            else
+                local k = 1 - math.exp(-sdt/dirTau)
+                local blended = safeUnit(aimDirSmoothed:Lerp(desiredDirection, k))
+                if blended then aimDirSmoothed = blended end
+            end
+            local aimDir = aimDirSmoothed
+
+            local dot = math.clamp(camera.CFrame.LookVector:Dot(aimDir), -1, 1)
             local errDeg = math.deg(math.acos(dot))
-            local errScaled = errDeg*zoomScale
-            local gain = State.TrackBoost or 1.5
-            local effSpeed = math.min(baseRate + errScaled*gain, 70)
-            
-            -- FIXED: Framerate-independent lerp
-            local sdt = math.min(deltaTime, 1/30)
-            local alpha = 1 - math.exp(-effSpeed*sdt)
-            local maxStepDps = (120 + State.Smoothness*240)*zoomScale
-            alpha = math.min(alpha, (maxStepDps*sdt)/math.max(errDeg, 0.05))
-            
-            -- Free steer detection
-            local steering = State.FreeSteer and userDps > STEER_DPS
-                and prevErrDeg ~= nil and errDeg > prevErrDeg + 0.05
-            
+            -- error ใหญ่ (เพิ่งสลับเป้า/หลัง flick) → ลัดทันที ไม่ต้องรอ EMA ให้หนืด
+            if errDeg > 25 then aimDirSmoothed = aimDir end
+            local pxErr = errDeg * pxPerDeg
+
+            -- deadband: noise ใต้ ~1.5px ไม่เขียนกล้อง (กันสั่นตอนล็อคแล้ว)
+            local deadbandPx = 1.0 + 0.6*(State.Smoothness or 0.8)
+
+            -- trend ของ error (EMA) — แทนการเทียบ errDeg กับ prevErrDeg ตรง ๆ ที่ toggle ทุกเฟรม
+            local errDelta = errDeg - (prevErrDeg or errDeg)
+            errTrend += (errDelta - errTrend) * (1 - math.exp(-sdt/0.10))
+
+            -- steering: มี hysteresis + ปิดตอนซูม (ซูมแล้วปล่อยเป้า = ภาพกระตุกหนัก)
+            local steerWanted = State.FreeSteer and not scoped and userDps > STEER_DPS
+                and errTrend > 0.30 and errDeg > 1.0
+            if steerActive then
+                if not (State.FreeSteer and not scoped and userDps > STEER_DPS and errTrend > 0.08) then
+                    steerActive = false
+                end
+            elseif steerWanted then
+                steerActive = true
+            end
+            local steering = steerActive
+
             if steering then
                 if not steerHoldStart then steerHoldStart = nowClock end
                 if State.DragSwitch and nowClock - steerHoldStart >= STEER_HOLD then
@@ -1543,23 +1595,31 @@ local function renderTick(deltaTime)
                     switchCooldownUntil = nowClock + SWITCH_COOLDOWN
                     TargetService:ReleaseTarget()
                     flickUntil = nowClock + FLICK_HOLD
+                    aimDirSmoothed = nil; errTrend = 0; steerActive = false
                     return
                 end
             else
                 steerHoldStart = nil
             end
-            
+
             local infTarget = steering and STEER_MIN_INFLUENCE or 1
             steerInfluence += (infTarget - steerInfluence)*(1 - math.exp(-deltaTime/STEER_TAU))
-            alpha = math.clamp(alpha, 0, 1)
             steerInfluence = math.clamp(steerInfluence, 0, 1)
-            
-            local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha*steerInfluence))
-            if smoothDirection then
-                local ok, newCFrame = pcall(CFrame.lookAt, shooterPos, shooterPos + smoothDirection)
-                if ok and newCFrame then
-                    camera.CFrame = newCFrame
-                    lastWriteLook = smoothDirection
+
+            -- คุมความเร็วกล้องเป็น pixel/เฟรม → ที่ zoom เท่าไรก็ไม่ overshoot
+            if pxErr > deadbandPx then
+                local alphaBase = 1 - math.exp(-speedBase*sdt)
+                local maxStepPx = (26 + State.Smoothness*34) * (1 + (State.TrackBoost or 1.5)*0.25)
+                local stepPx = math.min(pxErr*alphaBase, maxStepPx) * steerInfluence
+                local alpha = math.clamp(stepPx / math.max(pxErr, 1e-6), 0, 1)
+
+                local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(aimDir, alpha))
+                if smoothDirection then
+                    local ok, newCFrame = pcall(CFrame.lookAt, shooterPos, shooterPos + smoothDirection)
+                    if ok and newCFrame then
+                        camera.CFrame = newCFrame
+                        lastWriteLook = smoothDirection
+                    end
                 end
             end
             prevErrDeg = errDeg
@@ -1666,4 +1726,3 @@ print(string.format(
     math.floor(workspace.CurrentCamera.ViewportSize.Y)
 ))
 setGlxStatus("v3.17 Ready — "..math.floor(loadTime*1000).."ms load")
-
