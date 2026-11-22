@@ -13,6 +13,15 @@
   ✓ Ping: EMA แทนค่าดิบ (เดิมกระโดดทุก 0.5s → lead เปลี่ยน → จุดเล็งกระโดด)
   ✓ EMA ทิศทางเล็ง: tau ยาวขึ้นตาม zoom, snap เมื่อ error > 25°
 
+  CHANGELOG v3.17.1b (Teleport):
+  ✓ computeSpot: อยู่ "หลัง" เป้าจริง (เดิม CFrame.new(0,0,-DIST) = หน้าเป้า เพราะ LookVector = -Z)
+  ✓ หันหน้าเข้าหาเป้า (เดิมหันหลังให้เป้า dot = -1)
+  ✓ pickTarget ใช้ isValidEnemy (เคารพ TeamCheck/forcefield/HP) — เดิม hardcode team check ไม่สน toggle
+  ✓ crosshair โดนเพื่อน/NPC → fallback ไปหาเป้าใกล้กลางจอ (เดิม return nil = TP ไม่ทำงาน)
+  ✓ cooldown 0.6s + เช็ค State.Teleport (เดิมสแปมได้, toggle ไม่มีผลกับ logic)
+  ✓ กันโผล่ในผนัง (raycast เป้า→จุดหมาย), ground snap Y, เคลียร์ velocity, Humanoid.Sit = false
+  ✓ getgenv().Glx_TP = {Teleport, PickTarget, ComputeSpot, State} สำหรับ debug
+
   CHANGELOG v3.16 → v3.17:
   ✓ Torso targeting uses UpperTorso/LowerTorso (was: HumanoidRootPart)
   ✓ Visibility cache shared between ESP & aimbot (reduced Raycast calls)
@@ -88,6 +97,7 @@ function CleanupManager:CleanAll()
     table.clear(self.Drawings); table.clear(self.CustomCleanups)
     if getgenv().Glx_Cleanup == CleanupManager then
         getgenv().Glx_Cleanup = nil
+        getgenv().Glx_TP = nil
     end
 end
 if getgenv().SnyX_Cleanup and type(getgenv().SnyX_Cleanup.CleanAll) == "function" then
@@ -153,6 +163,7 @@ end
 -- 3.5 FORWARD DECLARATIONS
 -- ==========================================
 local WeaponService, ESPService, clearESPVisuals, setStickyStatus, TPService
+local isValidEnemyFn = nil   -- forward ref: isValidEnemy นิยามใน Part 2/5
 local setStatusFn = nil
 local function setGlxStatus(msg)
     print("[GLX] " .. tostring(msg))
@@ -400,7 +411,8 @@ setGlxStatus("v3.17 Ready")
 -- 3.9 TELEPORT SYSTEM (unchanged)
 -- ==========================================
 do
-    local DIST = 10; local TAP_SLOP = 8
+    local DIST = 10; local TAP_SLOP = 8; local TP_COOLDOWN = 0.6
+    local lastTP = -math.huge
     local tpGui = Instance.new("ScreenGui"); tpGui.Name = "Glx_BehindTP"; tpGui.ResetOnSpawn = false
     tpGui.DisplayOrder = 999998; tpGui.Parent = ScreenGui.Parent or game:GetService("CoreGui"); tpGui.Enabled = false
     CleanupManager:AddInstance("TPGui", tpGui)
@@ -417,44 +429,94 @@ do
 
     local function pickTarget()
         local cam = Workspace.CurrentCamera; if not cam then return nil end
+        local myChar = LocalPlayer.Character
+        local checkEnemy = isValidEnemyFn or function(plr) return plr ~= LocalPlayer end
+
+        -- 1) ray จากกลางจอ — ต้องเป็นศัตรูจริง (ใช้ isValidEnemy: เคารพ TeamCheck/forcefield/HP)
         local rayParams = RaycastParams.new(); rayParams.FilterType = Enum.RaycastFilterType.Exclude
-        local myChar = LocalPlayer.Character; rayParams.FilterDescendantsInstances = myChar and { myChar } or {}
+        rayParams.FilterDescendantsInstances = myChar and { myChar } or {}
         local hit = Workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 1000, rayParams)
-        local model = hit and hit.Instance:FindFirstAncestorOfClass("Model")
-        if not (model and model:FindFirstChildOfClass("Humanoid")) then
-            local vp = cam.ViewportSize / 2; local best, bestDist
-            for _, plr in Players:GetPlayers() do
-                if plr ~= LocalPlayer and not (LocalPlayer.Team ~= nil and plr.Team == LocalPlayer.Team) then
-                    local char = plr.Character; local hum = char and char:FindFirstChildOfClass("Humanoid")
-                    local root = char and char:FindFirstChild("HumanoidRootPart")
-                    if hum and root and hum.Health > 0 then
-                        local sp, on = cam:WorldToViewportPoint(root.Position)
-                        if on then
-                            local d = (Vector2.new(sp.X, sp.Y) - vp).Magnitude
-                            if not bestDist or d < bestDist then best, bestDist = root, d end
-                        end
+        if hit then
+            local model = hit.Instance:FindFirstAncestorOfClass("Model")
+            local plr = model and Players:GetPlayerFromCharacter(model)
+            if plr and checkEnemy(plr) then
+                local char = plr.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if root then return root end
+            end
+        end
+
+        -- 2) fallback: ใกล้กลางจอที่สุด — เดิมถ้า crosshair โดนเพื่อน/NPC จะ return nil ทันที (TP ไม่ทำงาน)
+        local vp = cam.ViewportSize * 0.5
+        local best, bestDist
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if checkEnemy(plr) then
+                local char = plr.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local sp, on = cam:WorldToViewportPoint(root.Position)
+                    if on and sp.Z > 0 then
+                        local d = (Vector2.new(sp.X, sp.Y) - vp).Magnitude
+                        if not bestDist or d < bestDist then best, bestDist = root, d end
                     end
                 end
             end
-            return best
         end
-        local plr = Players:GetPlayerFromCharacter(model)
-        if plr and plr ~= LocalPlayer and not (LocalPlayer.Team ~= nil and plr.Team == LocalPlayer.Team) then
-            local hum = model:FindFirstChildOfClass("Humanoid"); local root = model:FindFirstChild("HumanoidRootPart")
-            if hum and root and hum.Health > 0 then return root end
-        end
-        return nil
+        return best
+    end
+
+    -- FIXED: เดิมใช้ target.CFrame * CFrame.new(0, 0, -DIST) ซึ่ง = "หน้าเป้า" (LookVector = -Z)
+    --        → โผล่หน้าเป้าแล้วหันหลังให้เป้า (dot offset กับ LookVector = +10)
+    -- คืนค่า: spot (หลังเป้า), fwd (ทิศที่เป้ามอง → ใช้หันกลับไปหาเป้า)
+    local function computeSpot(targetCF)
+        local lv = targetCF.LookVector
+        local fwd = Vector3.new(lv.X, 0, lv.Z)
+        if fwd.Magnitude < 0.05 then fwd = Vector3.new(0, 0, -1) else fwd = fwd.Unit end
+        return targetCF.Position - fwd * DIST, fwd
     end
 
     local function teleport()
-        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if not myRoot then return end
-        local target = pickTarget(); if not target then setGlxStatus("No valid target found for TP"); return end
-        local spot = target.CFrame * CFrame.new(0, 0, -DIST)
-        local lv = target.CFrame.LookVector; local face = Vector3.new(lv.X, 0, lv.Z)
-        face = face.Magnitude > 0.05 and face.Unit or Vector3.new(0, 0, -1)
-        myRoot.CFrame = CFrame.lookAt(spot.Position, spot.Position + face)
-        setGlxStatus("Teleported behind target")
+        if not State.Teleport then setGlxStatus("Teleport is OFF"); return end
+        local now = os.clock()
+        if now - lastTP < TP_COOLDOWN then return end   -- กันสแปม CFrame (โดน rubber-band/flag)
+
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+        if not (hum and myRoot and hum.Health > 0) then setGlxStatus("No character for TP"); return end
+
+        local target = pickTarget()
+        if not target then setGlxStatus("No valid target found for TP"); return end
+
+        local spot, fwd = computeSpot(target.CFrame)
+
+        -- กันไปโผล่ในผนัง: ray จากเป้าไปจุดหมาย ถ้ามีของกั้นให้ขยับเข้ามาใกล้เป้า
+        local rp = RaycastParams.new(); rp.FilterType = Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances = { char, target.Parent }
+        local dir = spot - target.Position
+        if dir.Magnitude > 1e-3 then
+            local okRay, block = pcall(Workspace.Raycast, Workspace, target.Position, dir, rp)
+            if okRay and block and type(block.Distance) == "number" and block.Distance < dir.Magnitude - 0.5 then
+                spot = target.Position + dir.Unit * math.max(block.Distance - 1.5, 2)
+            end
+        end
+
+        -- วางบนพื้น (กันลอย/จมดิน เพราะ Y ของเป้าไม่ใช่ Y ของจุดหมาย)
+        local grp = RaycastParams.new(); grp.FilterType = Enum.RaycastFilterType.Exclude
+        grp.FilterDescendantsInstances = { char, target.Parent }
+        local okG, ground = pcall(Workspace.Raycast, Workspace, spot + Vector3.new(0, 4, 0), Vector3.new(0, -30, 0), grp)
+        if okG and ground then
+            spot = Vector3.new(spot.X, ground.Position.Y + 3, spot.Z)
+        end
+
+        lastTP = now
+        pcall(function() hum.Sit = false end)
+        pcall(function()
+            myRoot.AssemblyLinearVelocity = Vector3.zero
+            myRoot.AssemblyAngularVelocity = Vector3.zero
+        end)
+        myRoot.CFrame = CFrame.lookAt(spot, spot + fwd)   -- อยู่หลังเป้า + หันเข้าหาเป้า
+        setGlxStatus("TP behind " .. (target.Parent and target.Parent.Name or "target"))
     end
 
     local locked = false; local dragInput, dragStart, startPos
@@ -469,9 +531,14 @@ do
         if (io.Position - dragStart).Magnitude <= TAP_SLOP then teleport() end
     end))
     lockBadge.Activated:Connect(function() locked = not locked; lockBadge.Text = locked and "\u{1F512}" or "\u{1F513}" end)
-    TPService = { setEnabled = function(on) tpGui.Enabled = on and true or false end }
+    TPService = {
+        setEnabled = function(on) tpGui.Enabled = on and true or false end,
+        Teleport = teleport, PickTarget = pickTarget,
+    }
+    getgenv().Glx_TP = { Teleport = teleport, PickTarget = pickTarget, ComputeSpot = computeSpot, State = State }
 end
 
+if TPService and TPService.setEnabled then TPService.setEnabled(State.Teleport) end
 print("[GLX v3.17] PART 1/5 loaded — UI + Teleport ready")
 -- =====================================================================
 -- Part 2/5: Weapon Service + Visibility Service + Enemy Validity (v3.17)
@@ -721,6 +788,7 @@ local function isValidEnemy(player)
     end
     return true
 end
+isValidEnemyFn = isValidEnemy   -- ให้ TP service (Part 1/5) ใช้ team/forcefield check ชุดเดียวกับ ESP/aimbot
 CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(function(player)
     PlayerCache[player] = nil
     if player.Character then VisCache[player.Character] = nil end
@@ -1354,7 +1422,7 @@ do
             __newindex = function(t, k, v)
                 if k == "Position" then rawset(t, "_pos", v)
                 elseif k == "Radius" then rawset(t, "_radius", v)
-                else rawset(t, k) end
+                else rawset(t, k, v) end
             end
         }
         setmetatable(FOVCircle, mt)
