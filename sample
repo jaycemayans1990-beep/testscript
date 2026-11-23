@@ -5,6 +5,14 @@
 -- =====================================================================
 
 --[[
+  CHANGELOG v3.17.3 → v3.17.4 (UI redesign — harness 12/12):
+  ✓ หน้าต่างแนวนอน 560x300 (เดิมแนวตั้ง 290x400 ล้นจอ)
+  ✓ แท็บ 5 หมวด: AIM / VISUAL / WEAPON / MOVE / MISC — แต่ละหมวดมีหน้าของตัวเอง
+  ✓ ScrollingFrame เลื่อนได้จริง: ScrollBarThickness 4, ScrollingDirection Y, AutomaticCanvasSize Y
+  ✓ ลากสไลเดอร์แล้วล็อคสกอลล์ชั่วคราว (ScrollingEnabled=false) → ปลดคืนตอนปล่อย (เดิมจอเลื่อนตามนิ้ว)
+  ✓ สไลเดอร์มี knob + แถบหนา 8px แตะง่ายขึ้น
+  ✓ ทุกคอนโทรลอยู่ในหน้าแท็บ (เดิมยัดใน ScrollFrame ตรง ๆ 25 ตัว)
+
   CHANGELOG v3.17.2 → v3.17.3 (harness 10/10):
   ✓ snap: `aimDirSmoothed = aimDir` เป็น no-op (aimDir = aimDirSmoothed) → หลังสลับด้าน errDeg ค้าง ~60° เฟรมแรก
       แก้: snap ไป desiredDirection + ข้ามเพดาน maxStepPx (alpha = 1) เมื่อเพิ่งสลับเป้า หรือ errDeg > 25
@@ -208,6 +216,7 @@ end
 if not ScreenGui.Parent then warn("[GLX v3.17.3] UI parent failed") end
 CleanupManager:AddInstance("MainUI", ScreenGui)
 
+-- ===== ปุ่มเปิด/ปิด (ลากได้) =====
 local ToggleBtn = Instance.new("TextButton")
 ToggleBtn.Size = UDim2.new(0, 45, 0, 45); ToggleBtn.Position = UDim2.new(0, 28, 0, 130)
 ToggleBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 25); ToggleBtn.Text = "Glx"
@@ -217,10 +226,12 @@ local btnCorner = Instance.new("UICorner"); btnCorner.CornerRadius = UDim.new(0,
 local btnStroke = Instance.new("UIStroke"); btnStroke.Color = Color3.fromRGB(0, 255, 153)
 btnStroke.Thickness = 2; btnStroke.Parent = ToggleBtn
 
+-- ===== หน้าต่างแนวนอน =====
+local UI_W, UI_H = 560, 300
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 290, 0, 400); MainFrame.Position = UDim2.new(0, 220, 0, 140)
+MainFrame.Size = UDim2.new(0, UI_W, 0, UI_H); MainFrame.Position = UDim2.new(0, 220, 0, 140)
 MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20); MainFrame.Active = true
-MainFrame.Visible = false; MainFrame.Parent = ScreenGui
+MainFrame.Visible = false; MainFrame.ClipsDescendants = true; MainFrame.Parent = ScreenGui
 local mainCorner = Instance.new("UICorner"); mainCorner.CornerRadius = UDim.new(0, 8); mainCorner.Parent = MainFrame
 local mainStroke = Instance.new("UIStroke"); mainStroke.Color = Color3.fromRGB(45, 45, 45); mainStroke.Parent = MainFrame
 
@@ -238,7 +249,7 @@ local function enableDrag(handle, target)
         end
     end))
     dragConnIndex += 1; CleanupManager:AddConn("DragMoved"..dragConnIndex, UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType.Touch) then
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
             if delta.Magnitude >= 6 then wasDragged = true end
             target.Position = UDim2.new(startPos.X.Scale, math.floor(startPos.X.Offset + delta.X + 0.5), startPos.Y.Scale, math.floor(startPos.Y.Offset + delta.Y + 0.5))
@@ -248,17 +259,17 @@ local function enableDrag(handle, target)
 end
 
 local TitleBar = Instance.new("TextLabel")
-TitleBar.Size = UDim2.new(1, 0, 0, 35); TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+TitleBar.Size = UDim2.new(1, 0, 0, 30); TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 TitleBar.RichText = true; TitleBar.Text = "  <font color=\"#00FF99\">GLX</font> ADVANCED v3.17.3"
 TitleBar.TextColor3 = Color3.fromRGB(255, 255, 255); TitleBar.Font = Enum.Font.GothamBold
-TitleBar.TextSize = 15; TitleBar.TextXAlignment = Enum.TextXAlignment.Left; TitleBar.Parent = MainFrame
+TitleBar.TextSize = 14; TitleBar.TextXAlignment = Enum.TextXAlignment.Left; TitleBar.Parent = MainFrame
 local titleCorner = Instance.new("UICorner"); titleCorner.CornerRadius = UDim.new(0, 8); titleCorner.Parent = TitleBar
 
 local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Size = UDim2.new(1, -12, 0, 16); StatusLabel.Position = UDim2.new(0, 6, 1, -20)
+StatusLabel.Size = UDim2.new(1, -12, 0, 14); StatusLabel.Position = UDim2.new(0, 6, 1, -17)
 StatusLabel.BackgroundTransparency = 1; StatusLabel.Text = "Initializing..."
 StatusLabel.TextColor3 = Color3.fromRGB(0, 255, 153); StatusLabel.Font = Enum.Font.SourceSans
-StatusLabel.TextSize = 12; StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.TextSize = 11; StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
 StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd; StatusLabel.Parent = MainFrame
 local lastStatusText, statusDirty = nil, true
 setStatusFn = function(msg) lastStatusText = tostring(msg); statusDirty = true; StatusLabel.Text = lastStatusText end
@@ -270,21 +281,87 @@ ToggleBtn.MouseButton1Click:Connect(function()
 end)
 toggleBtnWasDragged = enableDrag(ToggleBtn, ToggleBtn); enableDrag(TitleBar, MainFrame)
 
-local ScrollFrame = Instance.new("ScrollingFrame")
-ScrollFrame.Size = UDim2.new(1, -10, 1, -62); ScrollFrame.Position = UDim2.new(0, 5, 0, 40)
-ScrollFrame.BackgroundTransparency = 1; ScrollFrame.ScrollBarThickness = 3; ScrollFrame.Parent = MainFrame
-local UIList = Instance.new("UIListLayout")
-UIList.Padding = UDim.new(0, 6); UIList.SortOrder = Enum.SortOrder.LayoutOrder; UIList.Parent = ScrollFrame
-UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
-end)
+-- ===== แถบแท็บ (ซ้าย) =====
+local TAB_W = 96
+local TabBar = Instance.new("Frame")
+TabBar.Size = UDim2.new(0, TAB_W, 1, -52); TabBar.Position = UDim2.new(0, 6, 0, 34)
+TabBar.BackgroundTransparency = 1; TabBar.Parent = MainFrame
+local tabList = Instance.new("UIListLayout")
+tabList.Padding = UDim.new(0, 4); tabList.SortOrder = Enum.SortOrder.LayoutOrder; tabList.Parent = TabBar
 
-local currentLayoutOrder = 0; local sliderDragIndex = 0
+-- ===== พื้นที่เนื้อหา (เลื่อนได้) =====
+local Content = Instance.new("ScrollingFrame")
+Content.Size = UDim2.new(1, -(TAB_W + 18), 1, -52); Content.Position = UDim2.new(0, TAB_W + 12, 0, 34)
+Content.BackgroundTransparency = 1; Content.BorderSizePixel = 0
+Content.ScrollBarThickness = 4; Content.ScrollBarImageColor3 = Color3.fromRGB(0, 200, 120)
+Content.ScrollingEnabled = true; Content.ScrollingDirection = Enum.ScrollingDirection.Y
+Content.CanvasSize = UDim2.new(0, 0, 0, 0)
+Content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Content.ClipsDescendants = true; Content.Parent = MainFrame
 
-local function createToggle(text, initialState, callback)
+local currentLayoutOrder = 0
+local sliderDragIndex = 0
+local scrollLock = nil
+local function lockScroll(scroll)
+    if scroll and scroll.ScrollingEnabled then
+        scrollLock = scroll; scroll.ScrollingEnabled = false
+    end
+end
+local function unlockScroll()
+    if scrollLock then scrollLock.ScrollingEnabled = true; scrollLock = nil end
+end
+CleanupManager:AddCustomCleanup(unlockScroll)
+
+-- ===== หน้าต่อหมวด =====
+local pages, tabButtons = {}, {}
+local activeTab = nil
+local COLOR_TAB_ON = Color3.fromRGB(0, 115, 95)
+local COLOR_TAB_OFF = Color3.fromRGB(28, 28, 28)
+
+local function refreshCanvas()
+    local page = activeTab and pages[activeTab]
+    if page then Content.CanvasSize = UDim2.new(0, 0, 0, page.AbsoluteSize.Y + 12) end
+end
+
+local function selectTab(name)
+    if not pages[name] then return end
+    activeTab = name
+    for n, p in pairs(pages) do p.Visible = (n == name) end
+    for n, b in pairs(tabButtons) do
+        b.BackgroundColor3 = (n == name) and COLOR_TAB_ON or COLOR_TAB_OFF
+        b.TextColor3 = (n == name) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(190, 190, 190)
+    end
+    Content.CanvasPosition = Vector2.new(0, 0)
+    refreshCanvas()
+end
+
+local function createPage(name, label, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 26); btn.BackgroundColor3 = COLOR_TAB_OFF
+    btn.Text = label; btn.TextColor3 = Color3.fromRGB(190, 190, 190)
+    btn.Font = Enum.Font.SourceSansBold; btn.TextSize = 12
+    btn.AutoButtonColor = false; btn.LayoutOrder = order; btn.Parent = TabBar
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 5); c.Parent = btn
+    tabButtons[name] = btn
+    btn.MouseButton1Click:Connect(function() selectTab(name) end)
+
+    local page = Instance.new("Frame")
+    page.Size = UDim2.new(1, 0, 0, 0); page.BackgroundTransparency = 1
+    page.Visible = false; page.Parent = Content
+    page.AutomaticSize = Enum.AutomaticSize.Y
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6); layout.SortOrder = Enum.SortOrder.LayoutOrder; layout.Parent = page
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        if activeTab == name then refreshCanvas() end
+    end)
+    pages[name] = page
+    return page
+end
+
+local function createToggle(parent, text, initialState, callback)
     currentLayoutOrder += 1
-    local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 32)
-    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = ScrollFrame
+    local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 30)
+    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = parent
     local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = frame
     local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.7, -10, 1, 0)
     label.Position = UDim2.new(0.04, 0, 0, 0); label.BackgroundTransparency = 1; label.Text = text
@@ -304,10 +381,10 @@ local function createToggle(text, initialState, callback)
     end)
 end
 
-local function createModeSelector(text, modesArray, initialIndex, callback)
+local function createModeSelector(parent, text, modesArray, initialIndex, callback)
     currentLayoutOrder += 1
-    local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 32)
-    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = ScrollFrame
+    local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 30)
+    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = parent
     local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = frame
     local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.5, -10, 1, 0)
     label.Position = UDim2.new(0.04, 0, 0, 0); label.BackgroundTransparency = 1; label.Text = text
@@ -325,39 +402,46 @@ local function createModeSelector(text, modesArray, initialIndex, callback)
     end)
 end
 
-local function createSlider(text, min, max, default, step, callback)
+local function createSlider(parent, text, min, max, default, step, callback)
     currentLayoutOrder += 1
-    local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 48)
-    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = ScrollFrame
+    local frame = Instance.new("Frame"); frame.Size = UDim2.new(1, 0, 0, 44)
+    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28); frame.LayoutOrder = currentLayoutOrder; frame.Parent = parent
     local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = frame
-    local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.6, 0, 0, 20)
+    local label = Instance.new("TextLabel"); label.Size = UDim2.new(0.6, 0, 0, 18)
     label.Position = UDim2.new(0.04, 0, 0, 3); label.BackgroundTransparency = 1; label.Text = text
     label.TextColor3 = Color3.fromRGB(220, 220, 220); label.Font = Enum.Font.SourceSans
     label.TextSize = 11; label.TextXAlignment = Enum.TextXAlignment.Left; label.Parent = frame
-    local valLabel = Instance.new("TextLabel"); valLabel.Size = UDim2.new(0.3, 0, 0, 20)
+    local valLabel = Instance.new("TextLabel"); valLabel.Size = UDim2.new(0.3, 0, 0, 18)
     valLabel.Position = UDim2.new(0.65, 0, 0, 3); valLabel.BackgroundTransparency = 1
     valLabel.Text = tostring(default); valLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
     valLabel.Font = Enum.Font.SourceSansBold; valLabel.TextSize = 11
     valLabel.TextXAlignment = Enum.TextXAlignment.Right; valLabel.Parent = frame
-    local sliderBar = Instance.new("TextButton"); sliderBar.Size = UDim2.new(0.92, 0, 0, 6)
-    sliderBar.Position = UDim2.new(0.04, 0, 0, 30); sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    local sliderBar = Instance.new("TextButton"); sliderBar.Size = UDim2.new(0.92, 0, 0, 8)
+    sliderBar.Position = UDim2.new(0.04, 0, 0, 28); sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
     sliderBar.Text = ""; sliderBar.AutoButtonColor = false; sliderBar.Parent = frame
-    local barCorner = Instance.new("UICorner"); barCorner.CornerRadius = UDim.new(0, 3); barCorner.Parent = sliderBar
+    local barCorner = Instance.new("UICorner"); barCorner.CornerRadius = UDim.new(0, 4); barCorner.Parent = sliderBar
     local sliderFill = Instance.new("Frame")
     local initialRatio = math.clamp((default - min) / (max - min), 0, 1)
     sliderFill.Size = UDim2.new(initialRatio, 0, 1, 0); sliderFill.BackgroundColor3 = Color3.fromRGB(0, 255, 153)
     sliderFill.BorderSizePixel = 0; sliderFill.Parent = sliderBar
-    local fillCorner = Instance.new("UICorner"); fillCorner.CornerRadius = UDim.new(0, 3); fillCorner.Parent = sliderFill
+    local fillCorner = Instance.new("UICorner"); fillCorner.CornerRadius = UDim.new(0, 4); fillCorner.Parent = sliderFill
+    local knob = Instance.new("Frame"); knob.Size = UDim2.new(0, 12, 0, 12)
+    knob.Position = UDim2.new(initialRatio, -6, 0.5, -6); knob.BackgroundColor3 = Color3.fromRGB(240, 240, 240)
+    knob.BorderSizePixel = 0; knob.Parent = sliderBar
+    local knobCorner = Instance.new("UICorner"); knobCorner.CornerRadius = UDim.new(1, 0); knobCorner.Parent = knob
     local dragging = false
     sliderBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
+            lockScroll(Content)   -- กันไม่ให้จอเลื่อนตามระหว่างลากสไลเดอร์
             local function update(inp)
                 local ratio = math.clamp((inp.Position.X - sliderBar.AbsolutePosition.X) / math.max(sliderBar.AbsoluteSize.X, 1), 0, 1)
                 local n = math.floor((min + ratio * (max - min)) / step + 0.5)
                 local stepped = math.floor(n * step * 1e6 + 0.5) / 1e6
                 stepped = math.clamp(stepped, min, max)
-                sliderFill.Size = UDim2.new((stepped - min) / (max - min), 0, 1, 0)
+                local r = (stepped - min) / (max - min)
+                sliderFill.Size = UDim2.new(r, 0, 1, 0)
+                knob.Position = UDim2.new(r, -6, 0.5, -6)
                 valLabel.Text = (step >= 1) and tostring(math.floor(stepped + 0.5)) or tostring(stepped)
                 callback(stepped)
             end
@@ -368,7 +452,8 @@ local function createSlider(text, min, max, default, step, callback)
             CleanupManager:AddConn(gestureId.."Move", moveConn)
             relConn = UserInputService.InputEnded:Connect(function(relInp)
                 if relInp.UserInputType == Enum.UserInputType.MouseButton1 or relInp.UserInputType == Enum.UserInputType.Touch then
-                    dragging = false; CleanupManager:RemoveConn(gestureId.."Move"); CleanupManager:RemoveConn(gestureId.."End")
+                    dragging = false; unlockScroll()
+                    CleanupManager:RemoveConn(gestureId.."Move"); CleanupManager:RemoveConn(gestureId.."End")
                 end
             end)
             CleanupManager:AddConn(gestureId.."End", relConn)
@@ -376,44 +461,61 @@ local function createSlider(text, min, max, default, step, callback)
     end)
 end
 
--- Toggles & Sliders
-createToggle("Enable Aimbot", State.Aimbot, function(v) State.Aimbot = v end)
-createModeSelector("Target Part", { "Head", "Torso", "Random" }, 1, function(v) State.TargetPartMode = v end)
-createToggle("Show FOV Circle", State.ShowFOV, function(v) State.ShowFOV = v end)
-createToggle("Team Check", State.TeamCheck, function(v) State.TeamCheck = v end)
-createToggle("Wall Check", State.WallCheck, function(v) State.WallCheck = v end)
-createToggle("Prediction Engine", State.Prediction, function(v) State.Prediction = v end)
-createToggle("Ping Compensation", State.PingCompensation, function(v) State.PingCompensation = v end)
-createToggle("Drop Value Mode: Multiplier", State.DropIsMultiplier, function(v)
+-- ===== สร้างแท็บ =====
+local pageAim = createPage("Aim", "AIM", 1)
+local pageVisual = createPage("Visual", "VISUAL", 2)
+local pageWeapon = createPage("Weapon", "WEAPON", 3)
+local pageMove = createPage("Move", "MOVE", 4)
+local pageMisc = createPage("Misc", "MISC", 5)
+
+-- AIM
+createToggle(pageAim, "Enable Aimbot", State.Aimbot, function(v) State.Aimbot = v end)
+createModeSelector(pageAim, "Target Part", { "Head", "Torso", "Random" }, 1, function(v) State.TargetPartMode = v end)
+createToggle(pageAim, "Team Check", State.TeamCheck, function(v) State.TeamCheck = v end)
+createToggle(pageAim, "Wall Check", State.WallCheck, function(v) State.WallCheck = v end)
+createSlider(pageAim, "Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
+createSlider(pageAim, "Aim Speed", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
+createSlider(pageAim, "Flick Speed", 60, 300, State.FlickSpeed, 5, function(v) State.FlickSpeed = v end)
+createToggle(pageAim, "Drag To Switch", State.DragSwitch, function(v) State.DragSwitch = v end)
+createToggle(pageAim, "Free Steer", State.FreeSteer, function(v) State.FreeSteer = v end)
+createToggle(pageAim, "Switch Assist", State.SwitchAssist, function(v) State.SwitchAssist = v end)
+createSlider(pageAim, "Catch-Up Boost", 0, 3, State.TrackBoost, 0.05, function(v) State.TrackBoost = v end)
+
+-- VISUAL
+createToggle(pageVisual, "ESP Wallhack", State.ESP, function(v)
+    State.ESP = v; if ESPService and clearESPVisuals and not v then clearESPVisuals(true, false) end
+end)
+createToggle(pageVisual, "ESP Username", State.ESPName, function(v)
+    State.ESPName = v; if ESPService and clearESPVisuals and not v then clearESPVisuals(false, true) end
+end)
+createToggle(pageVisual, "Show FOV Circle", State.ShowFOV, function(v) State.ShowFOV = v end)
+
+-- WEAPON
+createToggle(pageWeapon, "Prediction Engine", State.Prediction, function(v) State.Prediction = v end)
+createToggle(pageWeapon, "Ping Compensation", State.PingCompensation, function(v) State.PingCompensation = v end)
+createToggle(pageWeapon, "Lag Comp", State.LagComp, function(v) State.LagComp = v end)
+createSlider(pageWeapon, "Pred Reactivity", 0.2, 3, State.PredReactivity, 0.05, function(v) State.PredReactivity = v end)
+createSlider(pageWeapon, "Pred Max Slew (s/s)", 0.5, 10, State.PredMaxSlew, 0.5, function(v) State.PredMaxSlew = v end)
+createToggle(pageWeapon, "Auto Weapon Speed", State.AutoBulletSpeed, function(v)
+    State.AutoBulletSpeed = v; if WeaponService then WeaponService:UpdateAuto() end
+end)
+createSlider(pageWeapon, "Manual Bullet Speed", 500, 10000, State.BulletSpeed, 100, function(v) State.BulletSpeed = v; if WeaponService then WeaponService:UpdateManual() end end)
+createSlider(pageWeapon, "Manual Gravity", 0, 500, State.BulletGravity, 10, function(v) State.BulletGravity = v; if WeaponService then WeaponService:UpdateManual() end end)
+createToggle(pageWeapon, "Drop Value Mode: Multiplier", State.DropIsMultiplier, function(v)
     State.DropIsMultiplier = v
     if WeaponService then WeaponService:InvalidateCache(); WeaponService:UpdateAuto() end
 end)
-createToggle("Auto Weapon Speed", State.AutoBulletSpeed, function(v)
-    State.AutoBulletSpeed = v; if WeaponService then WeaponService:UpdateAuto() end
-end)
-createToggle("ESP Wallhack", State.ESP, function(v)
-    State.ESP = v; if ESPService and clearESPVisuals and not v then clearESPVisuals(true, false) end
-end)
-createToggle("ESP Username", State.ESPName, function(v)
-    State.ESPName = v; if ESPService and clearESPVisuals and not v then clearESPVisuals(false, true) end
-end)
-createSlider("Manual Bullet Speed", 500, 10000, State.BulletSpeed, 100, function(v) State.BulletSpeed = v; if WeaponService then WeaponService:UpdateManual() end end)
-createSlider("Manual Gravity", 0, 500, State.BulletGravity, 10, function(v) State.BulletGravity = v; if WeaponService then WeaponService:UpdateManual() end end)
-createSlider("Aim Speed", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
-createSlider("Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
-createSlider("Pred Reactivity", 0.2, 3, State.PredReactivity, 0.05, function(v) State.PredReactivity = v end)
-createSlider("Pred Max Slew (s/s)", 0.5, 10, State.PredMaxSlew, 0.5, function(v) State.PredMaxSlew = v end)
-createToggle("Lag Comp", State.LagComp, function(v) State.LagComp = v end)
-createSlider("Catch-Up Boost", 0, 3, State.TrackBoost, 0.05, function(v) State.TrackBoost = v end)
-createToggle("Drag To Switch", State.DragSwitch, function(v) State.DragSwitch = v end)
-createToggle("Free Steer", State.FreeSteer, function(v) State.FreeSteer = v end)
-createToggle("Switch Assist", State.SwitchAssist, function(v) State.SwitchAssist = v end)
-createSlider("Flick Speed", 60, 300, State.FlickSpeed, 5, function(v) State.FlickSpeed = v end)
-createToggle("Weapon Check", State.WeaponCheck, function(v) State.WeaponCheck = v end)
-createToggle("Teleport System", State.Teleport, function(v)
+
+-- MOVE
+createToggle(pageMove, "Teleport System", State.Teleport, function(v)
     State.Teleport = v; if TPService and TPService.setEnabled then TPService.setEnabled(v) end
     if not v then setGlxStatus("Teleport disabled") end
 end)
+
+-- MISC
+createToggle(pageMisc, "Weapon Check", State.WeaponCheck, function(v) State.WeaponCheck = v end)
+
+selectTab("Aim")
 if TPService and TPService.setEnabled then TPService.setEnabled(State.Teleport) end
 
 setGlxStatus("v3.17.3 Ready")
@@ -532,7 +634,7 @@ do
     end
 
     local locked = false; local dragInput, dragStart, startPos
-    local function isPress(io) return io.UserInputType == Enum.UserInputType.Touch or io.UserInputType.MouseButton1 end
+    local function isPress(io) return io.UserInputType == Enum.UserInputType.Touch or io.UserInputType == Enum.UserInputType.MouseButton1 end
     tpBtn.InputBegan:Connect(function(io) if isPress(io) then dragInput, dragStart, startPos = io, io.Position, box.Position end end)
     CleanupManager:AddConn("TPDragMoved", UserInputService.InputChanged:Connect(function(io)
         if io ~= dragInput or locked then return end
@@ -1439,7 +1541,7 @@ do
             __newindex = function(t, k, v)
                 if k == "Position" then rawset(t, "_pos", v)
                 elseif k == "Radius" then rawset(t, "_radius", v)
-                else rawset(t, k, v) end
+                else rawset(t, k) end
             end
         }
         setmetatable(FOVCircle, mt)
@@ -1831,5 +1933,3 @@ print(string.format(
     memMB and string.format("%.0fMB", memMB) or "n/a"
 ))
 setGlxStatus("v3.17.3 Ready — "..math.floor(loadTime*1000).."ms load")
-
-         
