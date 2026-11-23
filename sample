@@ -1816,7 +1816,7 @@ local function renderTick(deltaTime)
                 local stepPx = math.min(pxErr*alphaBase, maxStepPx) * steerInfluence
                 local alpha = math.clamp(stepPx / math.max(pxErr, 1e-6), 0, 1)
                 -- snap: ข้ามเพดานความเร็ว (maxStepPx) ไปเลย ไม่งั้น errDeg ใหญ่ยังต้องไล่หลายเฟรม
-                if snapped then alpha = 1 end
+                if snapped then alpha = 0.85 end
 
                 local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(aimDir, alpha))
                 if smoothDirection then
