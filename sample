@@ -5,6 +5,17 @@
 -- =====================================================================
 
 --[[
+  CHANGELOG v3.17.2 → v3.17.3 (harness 10/10):
+  ✓ snap: `aimDirSmoothed = aimDir` เป็น no-op (aimDir = aimDirSmoothed) → หลังสลับด้าน errDeg ค้าง ~60° เฟรมแรก
+      แก้: snap ไป desiredDirection + ข้ามเพดาน maxStepPx (alpha = 1) เมื่อเพิ่งสลับเป้า หรือ errDeg > 25
+  ✓ error วัดเทียบ desiredDirection (เป้าจริง) ไม่ใช่ aimDir (EMA) — เดิม EMA ชี้เป้าเก่า → errDeg เล็กผิด → ไม่ snap
+  ✓ prevAimTarget ล้างเมื่อไม่มีเป้า (เดิมค้าง → acquire เป้าเดิมกลับมาแล้ว targetChanged = false)
+  ✓ flick release ล้าง aimDirSmoothed/errTrend/steerActive (เดิมกล้องไถลตามทิศเป้าเก่าหลัง flick)
+  ✓ ESP ClearAll ล้าง ESPRegistry (เดิม sweeper ถือ instance ตายค้าง)
+  ✓ NameTag rebuild เมื่อ Adornee ไม่ใช่ Head ปัจจุบัน (เดิมค้างชี้ Head ที่ถูกแทน)
+  ✓ TP ground snap: เรย์จาก +25 ลง 120 (เดิม +4 ลง 30 → ดาดฟ้า/หลุมไม่เจอพื้น → ใช้ Y ของเป้า)
+  ✓ load report: guard CurrentCamera nil (เดิม index ตรง = error ท้ายสคริปต์) + แสดง memory จริง (getMemoryUsage เดิม dead code)
+
   CHANGELOG v3.17 → v3.17.1 (บั๊ก ESP บางคนไม่ติด + กล้องสั่นตอนซูม):
   ✓ getComponents: re-fetch part ที่เป็น nil ด้วย (เดิม cache poison → ผู้เล่นหลุด ESP ถาวร)
   ✓ Aim controller: เปลี่ยนจาก deg-rate×zoom เป็น pixel-space + deadband + EMA
@@ -50,7 +61,7 @@ if not LocalPlayer then
 end
 
 if not LocalPlayer then
-    warn("[GLX v3.17] LocalPlayer not found — aborting")
+    warn("[GLX v3.17.3] LocalPlayer not found — aborting")
     return
 end
 
@@ -108,7 +119,7 @@ if getgenv().Glx_Cleanup and type(getgenv().Glx_Cleanup.CleanAll) == "function" 
 end
 getgenv().Glx_Cleanup = CleanupManager
 getgenv().Glx_Running = true
-print("[GLX v3.17] step1: cleanup OK")
+print("[GLX v3.17.3] step1: cleanup OK")
 
 -- ==========================================
 -- 2. STATE
@@ -173,7 +184,7 @@ end
 -- ==========================================
 -- 3.6 UI CONSTRUCTION
 -- ==========================================
-print("[GLX v3.17] step2: building UI")
+print("[GLX v3.17.3] step2: building UI")
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "Glx_UI"; ScreenGui.ResetOnSpawn = false; ScreenGui.DisplayOrder = 999999
 do
@@ -194,7 +205,7 @@ do
         if okP and ScreenGui.Parent ~= nil then break end
     end
 end
-if not ScreenGui.Parent then warn("[GLX v3.17] UI parent failed") end
+if not ScreenGui.Parent then warn("[GLX v3.17.3] UI parent failed") end
 CleanupManager:AddInstance("MainUI", ScreenGui)
 
 local ToggleBtn = Instance.new("TextButton")
@@ -227,7 +238,7 @@ local function enableDrag(handle, target)
         end
     end))
     dragConnIndex += 1; CleanupManager:AddConn("DragMoved"..dragConnIndex, UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType.Touch) then
             local delta = input.Position - dragStart
             if delta.Magnitude >= 6 then wasDragged = true end
             target.Position = UDim2.new(startPos.X.Scale, math.floor(startPos.X.Offset + delta.X + 0.5), startPos.Y.Scale, math.floor(startPos.Y.Offset + delta.Y + 0.5))
@@ -238,7 +249,7 @@ end
 
 local TitleBar = Instance.new("TextLabel")
 TitleBar.Size = UDim2.new(1, 0, 0, 35); TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-TitleBar.RichText = true; TitleBar.Text = "  <font color=\"#00FF99\">GLX</font> ADVANCED v3.17"
+TitleBar.RichText = true; TitleBar.Text = "  <font color=\"#00FF99\">GLX</font> ADVANCED v3.17.3"
 TitleBar.TextColor3 = Color3.fromRGB(255, 255, 255); TitleBar.Font = Enum.Font.GothamBold
 TitleBar.TextSize = 15; TitleBar.TextXAlignment = Enum.TextXAlignment.Left; TitleBar.Parent = MainFrame
 local titleCorner = Instance.new("UICorner"); titleCorner.CornerRadius = UDim.new(0, 8); titleCorner.Parent = TitleBar
@@ -405,7 +416,7 @@ createToggle("Teleport System", State.Teleport, function(v)
 end)
 if TPService and TPService.setEnabled then TPService.setEnabled(State.Teleport) end
 
-setGlxStatus("v3.17 Ready")
+setGlxStatus("v3.17.3 Ready")
 
 -- ==========================================
 -- 3.9 TELEPORT SYSTEM (unchanged)
@@ -502,9 +513,10 @@ do
         end
 
         -- วางบนพื้น (กันลอย/จมดิน เพราะ Y ของเป้าไม่ใช่ Y ของจุดหมาย)
+        -- FIXED v3.17.3: เดิมเรย์จาก spot+4 ลงแค่ 30 studs → พื้นที่ต่ำ/สูงกว่านั้น (ดาดฟ้า/หลุม) ไม่เจอ → ใช้ Y ของเป้า
         local grp = RaycastParams.new(); grp.FilterType = Enum.RaycastFilterType.Exclude
         grp.FilterDescendantsInstances = { char, target.Parent }
-        local okG, ground = pcall(Workspace.Raycast, Workspace, spot + Vector3.new(0, 4, 0), Vector3.new(0, -30, 0), grp)
+        local okG, ground = pcall(Workspace.Raycast, Workspace, spot + Vector3.new(0, 25, 0), Vector3.new(0, -120, 0), grp)
         if okG and ground then
             spot = Vector3.new(spot.X, ground.Position.Y + 3, spot.Z)
         end
@@ -520,7 +532,7 @@ do
     end
 
     local locked = false; local dragInput, dragStart, startPos
-    local function isPress(io) return io.UserInputType == Enum.UserInputType.Touch or io.UserInputType == Enum.UserInputType.MouseButton1 end
+    local function isPress(io) return io.UserInputType == Enum.UserInputType.Touch or io.UserInputType.MouseButton1 end
     tpBtn.InputBegan:Connect(function(io) if isPress(io) then dragInput, dragStart, startPos = io, io.Position, box.Position end end)
     CleanupManager:AddConn("TPDragMoved", UserInputService.InputChanged:Connect(function(io)
         if io ~= dragInput or locked then return end
@@ -539,7 +551,7 @@ do
 end
 
 if TPService and TPService.setEnabled then TPService.setEnabled(State.Teleport) end
-print("[GLX v3.17] PART 1/5 loaded — UI + Teleport ready")
+print("[GLX v3.17.3] PART 1/5 loaded — UI + Teleport ready")
 -- =====================================================================
 -- Part 2/5: Weapon Service + Visibility Service + Enemy Validity (v3.17)
 -- ต้องมี Part 1/5 รันก่อน
@@ -605,6 +617,7 @@ function WeaponService:UpdateAuto()
     
     WeaponCache[tool] = { Speed = speed, Gravity = gravity }
     self.Speed = speed; self.Gravity = gravity
+    return
 end
 
 local HookedTools = setmetatable({}, { __mode = "k" })
@@ -794,7 +807,7 @@ CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(fu
     if player.Character then VisCache[player.Character] = nil end
 end))
 
-print("[GLX v3.17] PART 2/5 loaded — Weapon + Visibility + EnemyValidity ready")
+print("[GLX v3.17.3] PART 2/5 loaded — Weapon + Visibility + EnemyValidity ready")
 -- =====================================================================
 -- Part 3/5: Target Service + Prediction Engine (v3.17)
 -- ต้องมี Part 1+2 รันก่อน
@@ -1156,7 +1169,7 @@ local function getPredictedPosition(targetPart, shooterPos, deltaTime, leadTime,
     return targetPos
 end
 
-print("[GLX v3.17] PART 3/5 loaded — TargetService + Prediction ready")
+print("[GLX v3.17.3] PART 3/5 loaded — TargetService + Prediction ready")
 -- =====================================================================
 -- Part 4/5: ESP Service (v3.17) — shared visibility cache with aimbot
 -- ต้องมี Part 1+2+3 รันก่อน
@@ -1192,6 +1205,8 @@ function ESPService:ClearAll()
         end
     end
     table.clear(self.Cache)
+    -- FIXED v3.17.3: เดิมไม่ล้าง ESPRegistry → sweeper ยังถือ instance ที่ตายแล้ว (ค้างจน GC)
+    table.clear(ESPRegistry)
 end
 CleanupManager:AddCustomCleanup(function() ESPService:ClearAll() end)
 CleanupManager:AddConn("PlayerRemovingESP", Players.PlayerRemoving:Connect(function(player)
@@ -1298,7 +1313,9 @@ function ESPService:ProcessESP()
                         end
                         if head then
                             local nt = entry.NameTag
-                            if not nt or nt.Parent ~= char then
+                            -- FIXED v3.17.3: ต้อง rebuild เมื่อ Adornee ไม่ใช่ head ปัจจุบัน (เดิมค้างชี้ Head ที่ถูกแทน)
+                            if not nt or nt.Parent ~= char or nt.Adornee ~= head then
+                                if nt then pcall(nt.Destroy, nt) end
                                 entry.NameTag = buildNameTag(char, head, player.DisplayName or player.Name)
                                 nt = entry.NameTag
                                 entry.Label = nt and nt:FindFirstChild("TagLabel") or nil
@@ -1342,7 +1359,7 @@ local function connectESP()
             else
                 espErrStreak += 1
                 if espErrStreak == 5 then
-                    warn("[GLX v3.17] ESP tick error: "..tostring(err))
+                    warn("[GLX v3.17.3] ESP tick error: "..tostring(err))
                     if setStickyStatus then setStickyStatus("ESP error: "..tostring(err):sub(1,40)) end
                 end
             end
@@ -1384,7 +1401,7 @@ task.spawn(function()
     end
 end)
 
-print("[GLX v3.17] PART 4/5 loaded — ESP Service ready")
+print("[GLX v3.17.3] PART 4/5 loaded — ESP Service ready")
 -- =====================================================================
 -- Part 5/5: Main Camera Engine + Watchdog + FPS Meter (v3.17)
 -- ต้องมี Part 1-4 รันก่อน
@@ -1444,7 +1461,7 @@ local function hasActiveWeapon()
     return character:FindFirstChildOfClass("Tool") ~= nil
 end
 
-print("[GLX v3.17] Main loop starting...")
+print("[GLX v3.17.3] Main loop starting...")
 
 local flickUntil = 0; local flickArmStart = nil
 local FLICK_ARM = 0.06; local prevReadLook = nil; local lastWriteLook = nil
@@ -1455,6 +1472,7 @@ local prevErrDeg = nil; local lastRenderTick = os.clock()
 local renderErrStreak = 0
 -- v3.17.1: ตัวแปรกรองสัญญาณ (แก้กล้องสั่นตอนซูม)
 local aimDirSmoothed = nil   -- EMA ของทิศทางเล็ง (กรอง noise จาก prediction)
+local prevAimTarget = nil    -- เป้าเฟรมก่อน — ใช้ตรวจว่าเพิ่งสลับเป้า (ต้อง snap)
 local errTrend = 0           -- EMA ของอัตราการเปลี่ยน error (deg/frame) ใช้ตัดสิน steering
 local steerActive = false    -- hysteresis flag กัน steerInfluence แกว่งทุกเฟรม
 
@@ -1472,7 +1490,7 @@ local function renderTick(deltaTime)
         if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
         prevErrDeg = nil; steerInfluence = 1
         steerHoldStart = nil; flickArmStart = nil
-        aimDirSmoothed = nil; errTrend = 0; steerActive = false
+        aimDirSmoothed = nil; errTrend = 0; steerActive = false; prevAimTarget = nil
     end
     
     if aiming then
@@ -1556,7 +1574,9 @@ local function renderTick(deltaTime)
             switchCooldownUntil = nowClock + SWITCH_COOLDOWN
             TargetService:ReleaseTarget()
         end
+        -- FIXED v3.17.3: เดิมไม่ล้าง EMA/trend → หลัง flick กล้องยังไถลตามทิศเป้าเก่า
         steerInfluence = 1; steerHoldStart = nil; prevErrDeg = nil
+        aimDirSmoothed = nil; errTrend = 0; steerActive = false
         return
     end
     
@@ -1595,6 +1615,8 @@ local function renderTick(deltaTime)
     end
     
     -- Aim at target
+    -- ไม่มีเป้า = ล้างตัวจำ ไม่งั้น acquire เป้าเดิมกลับมาแล้ว targetChanged เป็น false → ไม่ snap
+    if not TargetService.CurrentTarget then prevAimTarget = nil end
     local targetPart = TargetService.TargetPart
     if TargetService.CurrentTarget and targetPart and targetPart.Parent then
         local shooterPos = camera.CFrame.Position
@@ -1631,10 +1653,21 @@ local function renderTick(deltaTime)
             end
             local aimDir = aimDirSmoothed
 
-            local dot = math.clamp(camera.CFrame.LookVector:Dot(aimDir), -1, 1)
+            -- FIXED v3.17.3: วัด error เทียบ desiredDirection (เป้าจริง) ไม่ใช่ aimDir (EMA)
+            -- เดิมหลังสลับด้าน EMA ชี้เป้าเก่า → errDeg เล็กผิด ๆ → ไม่ snap → กล้องไถลไปผิดทาง
+            local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
             local errDeg = math.deg(math.acos(dot))
-            -- error ใหญ่ (เพิ่งสลับเป้า/หลัง flick) → ลัดทันที ไม่ต้องรอ EMA ให้หนืด
-            if errDeg > 25 then aimDirSmoothed = aimDir end
+            -- error ใหญ่ (เพิ่งสลับเป้า/หลัง flick) → snap ทันที ไม่ต้องรอ EMA ให้หนืด
+            -- FIXED v3.17.3: เดิม `aimDirSmoothed = aimDir` เป็น no-op (aimDir = aimDirSmoothed อยู่แล้ว)
+            --   → EMA ยังชี้เป้าเก่า หลังสลับด้าน errDeg ค้าง ~60° ในเฟรมแรก
+            local targetChanged = TargetService.CurrentTarget ~= prevAimTarget
+            prevAimTarget = TargetService.CurrentTarget
+            local snapped = false
+            if targetChanged or errDeg > 25 then
+                aimDirSmoothed = desiredDirection
+                aimDir = desiredDirection
+                snapped = true
+            end
             local pxErr = errDeg * pxPerDeg
 
             -- deadband: noise ใต้ ~1.5px ไม่เขียนกล้อง (กันสั่นตอนล็อคแล้ว)
@@ -1680,6 +1713,8 @@ local function renderTick(deltaTime)
                 local maxStepPx = (26 + State.Smoothness*34) * (1 + (State.TrackBoost or 1.5)*0.25)
                 local stepPx = math.min(pxErr*alphaBase, maxStepPx) * steerInfluence
                 local alpha = math.clamp(stepPx / math.max(pxErr, 1e-6), 0, 1)
+                -- snap: ข้ามเพดานความเร็ว (maxStepPx) ไปเลย ไม่งั้น errDeg ใหญ่ยังต้องไล่หลายเฟรม
+                if snapped then alpha = 1 end
 
                 local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(aimDir, alpha))
                 if smoothDirection then
@@ -1705,7 +1740,7 @@ local function connectRenderLoop()
         else
             renderErrStreak += 1
             if renderErrStreak == 10 then
-                warn("[GLX v3.17] aim loop error: "..tostring(err))
+                warn("[GLX v3.17.3] aim loop error: "..tostring(err))
                 if setStickyStatus then setStickyStatus("aim error: "..tostring(err):sub(1,40)) end
             end
         end
@@ -1716,12 +1751,12 @@ connectRenderLoop()
 -- ==========================================
 -- 10. WATCHDOG + FPS METER
 -- ==========================================
-setGlxStatus("v3.17 Systems Active")
+setGlxStatus("v3.17.3 Systems Active")
 
 local stickyMsg, stickyUntil = nil, 0
 setStickyStatus = function(msg)
     stickyMsg = tostring(msg); stickyUntil = os.clock() + 6
-    warn("[GLX v3.17] "..stickyMsg)
+    warn("[GLX v3.17.3] "..stickyMsg)
     if StatusLabel then StatusLabel.Text = stickyMsg end
 end
 
@@ -1777,20 +1812,24 @@ end
 -- 11. LOAD REPORT
 -- ==========================================
 local loadTime = os.clock()
-local function getMemoryUsage()
-    local ok, stats = pcall(function() return game:GetService("Stats") end)
-    if ok and stats then
-        local mem = stats:FindFirstChild("PerformanceStats") or stats:FindFirstChild("Memory")
-        if mem then return mem end
-    end
+-- FIXED v3.17.3: เดิมประกาศแล้วไม่ถูกใช้เลย (dead code)
+local function getMemoryMB()
+    local ok, mb = pcall(function() return game:GetService("Stats"):GetTotalMemoryUsageMb() end)
+    if ok and type(mb) == "number" then return mb end
     return nil
 end
 
+-- FIXED v3.17.3: CurrentCamera อาจเป็น nil ตอนจบ (เดิม index ตรง ๆ = error ท้ายสคริปต์)
+local vpEnd = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(0, 0)
+local memMB = getMemoryMB()
 print(string.format(
-    "[GLX v3.17] ALL SYSTEMS READY ✅ | load=%.3fs | gravity=%d | viewport=%dx%d",
+    "[GLX v3.17.3] ALL SYSTEMS READY ✅ | load=%.3fs | gravity=%d | viewport=%dx%d | mem=%s",
     loadTime,
     workspace.Gravity,
-    math.floor(workspace.CurrentCamera.ViewportSize.X),
-    math.floor(workspace.CurrentCamera.ViewportSize.Y)
+    math.floor(vpEnd.X),
+    math.floor(vpEnd.Y),
+    memMB and string.format("%.0fMB", memMB) or "n/a"
 ))
-setGlxStatus("v3.17 Ready — "..math.floor(loadTime*1000).."ms load")
+setGlxStatus("v3.17.3 Ready — "..math.floor(loadTime*1000).."ms load")
+
+         
